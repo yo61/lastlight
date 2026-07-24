@@ -234,6 +234,8 @@ export function sandboxFor(backend: SandboxBackend, opts: SandboxFactoryOpts): S
       return new InProcessSandbox("gondolin", opts);
     case "none":
       return new InProcessSandbox("none", opts);
+    case "kubernetes":
+      throw new Error("kubernetes sandbox backend not yet available (implemented in Plan 1 Task 6)");
   }
 }
 

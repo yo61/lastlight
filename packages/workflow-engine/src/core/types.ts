@@ -15,7 +15,7 @@
 // ── Config sub-types (were in config/config.ts) ──────────────────────────────
 
 /** Workflow sandbox backend. */
-export type SandboxBackend = "gondolin" | "docker" | "smol" | "none";
+export type SandboxBackend = "gondolin" | "docker" | "smol" | "none" | "kubernetes";
 
 /** Where build handoff docs live for a run. */
 export type BuildAssetsLocation = "repo" | "server";
