@@ -7,9 +7,12 @@ describe.runIf(RUN)("KubernetesSandbox (integration)", () => {
   it(
     "runs a bash command in a real pod and streams stdout",
     async () => {
+      // Unique per run so a prior run's pod (deterministic name) can't collide,
+      // and always dispose so a failed assertion never orphans a pod.
+      const taskId = `k8s-it-${Date.now()}`;
       const sbx = new KubernetesSandbox(
         {
-          taskId: `it-${Date.now()}`,
+          taskId,
           egress: { unrestricted: false, hosts: [] },
           env: {},
           stateDir: "/tmp",
@@ -21,13 +24,16 @@ describe.runIf(RUN)("KubernetesSandbox (integration)", () => {
         },
       );
       await sbx.provision();
-      const res = await sbx.runCommand("it", "echo hello-from-pod", {
-        cwd: "/home/agent/workspace",
-        timeoutSeconds: 120,
-      });
-      expect(res.stdout).toContain("hello-from-pod");
-      expect(res.exitCode).toBe(0);
-      await sbx.dispose();
+      try {
+        const res = await sbx.runCommand(taskId, "echo hello-from-pod", {
+          cwd: "/home/agent/workspace",
+          timeoutSeconds: 120,
+        });
+        expect(res.stdout).toContain("hello-from-pod");
+        expect(res.exitCode).toBe(0);
+      } finally {
+        await sbx.dispose();
+      }
     },
     180_000,
   );
