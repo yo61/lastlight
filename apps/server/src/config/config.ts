@@ -110,6 +110,15 @@ export interface LastLightConfig {
   variants: VariantConfig;
   maxTurns: number;
   sandbox: SandboxBackend;
+  /**
+   * The `kubernetes` backend's own config block (namespace/image/PVC/security
+   * context), normalized from `sandbox.kubernetes` in the YAML config. Kept as
+   * a separate field rather than reshaping `sandbox` above, which many call
+   * sites read as the plain backend string. `undefined` when the block is
+   * absent from config — {@link resolveKubernetesConfig} applies env
+   * overrides and defaults on top.
+   */
+  kubernetes?: Partial<KubernetesConfig>;
   /** Where build handoff docs live: "repo" (committed) | "server" (externalized). */
   buildAssets: BuildAssetsLocation;
   /** Filesystem root for server-mode build assets (default $STATE_DIR/build-assets). */
@@ -156,6 +165,19 @@ export interface LastLightConfig {
    * dir cap (`maxDirs`). Replaces the out-of-band host cron.
    */
   cleanup: { sandbox: SandboxCleanupConfig };
+}
+
+/** The `kubernetes` sandbox backend's own config surface — namespace, image,
+ *  and the PVC/security-context knobs later Plan-2 tasks wire into the
+ *  adapter. Resolved by {@link resolveKubernetesConfig}, never read directly
+ *  off `LastLightConfig` (kept off the `sandbox` field, which many call sites
+ *  read as the plain `SandboxBackend` string). */
+export interface KubernetesConfig {
+  namespace: string;
+  image: string;
+  storageClassName: string;
+  workspaceSize: string;
+  runAsUser: number;
 }
 
 export interface SandboxCleanupConfig {
@@ -413,6 +435,7 @@ export function loadConfig(): LastLightConfig {
     variants,
     maxTurns,
     sandbox,
+    kubernetes: fileCfg.kubernetes,
     buildAssets,
     buildAssetsDir,
     deploy: fileCfg.deploy,
@@ -454,6 +477,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
   models: ModelConfig;
   variants: VariantConfig;
   sandbox: { backend: SandboxBackend; maxTurns: number };
+  kubernetes?: Partial<KubernetesConfig>;
   buildAssets: BuildAssetsLocation;
   deploy: { version: string | null };
   approval: Record<string, boolean>;
@@ -471,6 +495,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
   const modelsRaw = isPlainObject(raw.models) ? raw.models : {};
   const variantsRaw = isPlainObject(raw.variants) ? raw.variants : {};
   const sandboxRaw = isPlainObject(raw.sandbox) ? raw.sandbox : {};
+  const kubernetesRaw = isPlainObject(sandboxRaw.kubernetes) ? sandboxRaw.kubernetes : undefined;
   const buildAssetsRaw = isPlainObject(raw.buildAssets) ? raw.buildAssets : {};
   const deployRaw = isPlainObject(raw.deploy) ? raw.deploy : {};
   const bootstrapRaw = isPlainObject(raw.bootstrap) ? raw.bootstrap : {};
@@ -491,6 +516,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
 
   const backend = sandboxBackend(sandboxRaw.backend, "sandbox.backend");
   const maxTurns = typeof sandboxRaw.maxTurns === "number" ? sandboxRaw.maxTurns : 200;
+  const kubernetes = kubernetesRaw ? normalizeKubernetesFileConfig(kubernetesRaw) : undefined;
   const buildAssets = buildAssetsLocation(buildAssetsRaw.location, "buildAssets.location");
   const deployVersion = typeof deployRaw.version === "string" && deployRaw.version.trim() ? deployRaw.version.trim() : null;
   const bootstrapLabel = typeof bootstrapRaw.label === "string" ? bootstrapRaw.label : "lastlight:bootstrap";
@@ -536,6 +562,7 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
     models,
     variants,
     sandbox: { backend, maxTurns },
+    kubernetes,
     buildAssets,
     deploy: { version: deployVersion },
     approval,
@@ -546,6 +573,24 @@ function normalizeFileConfig(raw: Record<string, unknown>): {
     concurrency: { maxWorkflows, maxQueueWaitMs },
     cleanup: { sandbox: sandboxCleanup },
   };
+}
+
+/**
+ * Guard the `sandbox.kubernetes` YAML block field-by-field, keeping only the
+ * present, correctly-typed fields — never fills in defaults (that's
+ * {@link resolveKubernetesConfig}'s job, so env can still override a value
+ * this block leaves unset).
+ */
+function normalizeKubernetesFileConfig(raw: Record<string, unknown>): Partial<KubernetesConfig> {
+  const out: Partial<KubernetesConfig> = {};
+  if (typeof raw.namespace === "string" && raw.namespace.trim()) out.namespace = raw.namespace.trim();
+  if (typeof raw.image === "string" && raw.image.trim()) out.image = raw.image.trim();
+  if (typeof raw.storageClassName === "string" && raw.storageClassName.trim()) {
+    out.storageClassName = raw.storageClassName.trim();
+  }
+  if (typeof raw.workspaceSize === "string" && raw.workspaceSize.trim()) out.workspaceSize = raw.workspaceSize.trim();
+  if (typeof raw.runAsUser === "number" && Number.isFinite(raw.runAsUser)) out.runAsUser = raw.runAsUser;
+  return out;
 }
 
 function normalizeRoutes(raw: unknown): RouteConfig {
@@ -798,6 +843,40 @@ export function resolveModel(models: ModelConfig, taskType: string): string {
 
 export function resolveVariant(variants: VariantConfig, taskType: string): string | undefined {
   return variants[taskType] || variants.default;
+}
+
+/** Hardcoded fallback for every {@link KubernetesConfig} field, used only when
+ *  neither an env override nor the runtime `sandbox.kubernetes` block supplies
+ *  a value. The image is registry-qualified (yo61 org on GHCR) — the
+ *  `kubernetes` backend runs on a real cluster, which can't resolve the
+ *  docker-local `lastlight-sandbox:latest` tag the other backends use. */
+const K8S_DEFAULTS: KubernetesConfig = {
+  namespace: "lastlight-sandboxes",
+  image: "ghcr.io/yo61/lastlight-sandbox:latest",
+  storageClassName: "truenas-iscsi",
+  workspaceSize: "5Gi",
+  runAsUser: 10001,
+};
+
+/**
+ * Resolve the `kubernetes` sandbox backend's config: env override → the
+ * runtime `sandbox.kubernetes` block (if config has been loaded) → hardcoded
+ * defaults. `getRuntimeConfig()` returns `undefined` rather than throwing
+ * when no config is loaded, so this is safe to call from tests or any code
+ * path that runs before `loadConfig()`.
+ */
+export function resolveKubernetesConfig(): KubernetesConfig {
+  const k = getRuntimeConfig()?.kubernetes ?? {};
+  const runAsUserEnv = parseInt(process.env.LASTLIGHT_K8S_RUN_AS_USER ?? "", 10);
+  return {
+    namespace: process.env.LASTLIGHT_K8S_NAMESPACE ?? k.namespace ?? K8S_DEFAULTS.namespace,
+    image: process.env.K8S_SANDBOX_IMAGE ?? k.image ?? K8S_DEFAULTS.image,
+    storageClassName:
+      process.env.LASTLIGHT_K8S_STORAGE_CLASS ?? k.storageClassName ?? K8S_DEFAULTS.storageClassName,
+    workspaceSize:
+      process.env.LASTLIGHT_K8S_WORKSPACE_SIZE ?? k.workspaceSize ?? K8S_DEFAULTS.workspaceSize,
+    runAsUser: Number.isFinite(runAsUserEnv) ? runAsUserEnv : (k.runAsUser ?? K8S_DEFAULTS.runAsUser),
+  };
 }
 
 /**

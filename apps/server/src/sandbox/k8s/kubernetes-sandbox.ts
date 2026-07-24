@@ -41,10 +41,20 @@ const FATAL_WAITING_REASONS = new Set([
 
 /** Skeleton config the adapter needs; grows in later plans (namespace/image
  *  stay fixed here — the PVC, skill staging, and stdin/attach wiring land in
- *  Plans 2-3). */
+ *  Plans 2-3).
+ *
+ *  `storageClassName` / `workspaceSize` / `runAsUser` are optional for now —
+ *  the factory (`sandbox.ts`) already resolves and passes all five fields via
+ *  `resolveKubernetesConfig()`, but the adapter itself doesn't consume the
+ *  latter three until the PVC (Task 2) and security-context (Task 5) wiring
+ *  lands. Made required then; kept optional here to avoid a mid-plan type
+ *  break. */
 export interface K8sAdapterConfig {
   namespace: string;
   image: string;
+  storageClassName?: string;
+  workspaceSize?: string;
+  runAsUser?: number;
   /** Injectable fake `K8sApis` for tests; defaults to the real client. */
   apis?: K8sApis;
 }
