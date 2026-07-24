@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { KubeConfig } from "@kubernetes/client-node";
-import { makeK8sApis } from "#src/sandbox/k8s/client.js";
+import { makeK8sApis, inClusterConfigAvailable } from "#src/sandbox/k8s/client.js";
 
 describe("makeK8sApis", () => {
   it("builds core + log clients from an injected KubeConfig", () => {
@@ -14,5 +14,18 @@ describe("makeK8sApis", () => {
     const apis = makeK8sApis(kc);
     expect(apis.core).toBeDefined();
     expect(apis.log).toBeDefined();
+  });
+});
+
+describe("inClusterConfigAvailable", () => {
+  // Regression: loadFromCluster() does NOT throw off-cluster in
+  // @kubernetes/client-node 1.4.0 — it builds https://undefined:undefined.
+  // So we select the source by KUBERNETES_SERVICE_HOST, not by catching.
+  it("is true only when KUBERNETES_SERVICE_HOST is set (in a Pod)", () => {
+    expect(inClusterConfigAvailable({ KUBERNETES_SERVICE_HOST: "10.0.0.1" })).toBe(true);
+  });
+  it("is false off-cluster (no service-host env → use local kubeconfig)", () => {
+    expect(inClusterConfigAvailable({})).toBe(false);
+    expect(inClusterConfigAvailable({ KUBERNETES_SERVICE_HOST: "" })).toBe(false);
   });
 });
