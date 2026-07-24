@@ -45,10 +45,11 @@ const FATAL_WAITING_REASONS = new Set([
  *
  *  `storageClassName` / `workspaceSize` / `runAsUser` are optional for now —
  *  the factory (`sandbox.ts`) already resolves and passes all five fields via
- *  `resolveKubernetesConfig()`, but the adapter itself doesn't consume the
- *  latter three until the PVC (Task 2) and security-context (Task 5) wiring
- *  lands. Made required then; kept optional here to avoid a mid-plan type
- *  break. */
+ *  `resolveKubernetesConfig()`. `runAsUser` is consumed as of Task 2 (defaults
+ *  to 10001 when unset — a stopgap; see the `runAsUser` field below), but
+ *  `storageClassName`/`workspaceSize` stay unused until the PVC (Task 5)
+ *  wiring lands. Made required then; kept optional here to avoid a mid-plan
+ *  type break. */
 export interface K8sAdapterConfig {
   namespace: string;
   image: string;
@@ -73,6 +74,8 @@ export class KubernetesSandbox implements Sandbox {
   private readonly apis: K8sApis;
   private readonly ns: string;
   private readonly image: string;
+  // Stopgap default until Task 6 finalizes cluster-wide runAsUser wiring.
+  private readonly runAsUser: number;
   private activePod?: string;
 
   constructor(
@@ -82,6 +85,7 @@ export class KubernetesSandbox implements Sandbox {
     this.apis = cfg.apis ?? makeK8sApis();
     this.ns = cfg.namespace;
     this.image = opts.imageName ?? cfg.image;
+    this.runAsUser = cfg.runAsUser ?? 10001;
   }
 
   async provision(_pre?: PrePopulateSpec): Promise<ProvisionResult> {
@@ -184,6 +188,7 @@ export class KubernetesSandbox implements Sandbox {
       env,
       cwd,
       activeDeadlineSeconds: timeoutSeconds ?? this.opts.timeoutSeconds ?? 1800,
+      runAsUser: this.runAsUser,
     });
     await this.apis.core.createNamespacedPod({ namespace: this.ns, body: manifest });
     await this.waitForContainerStart(name);

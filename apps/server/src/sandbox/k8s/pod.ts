@@ -8,6 +8,7 @@ export interface PodSpecInput {
   env: Record<string, string>;
   cwd: string;
   activeDeadlineSeconds: number;
+  runAsUser: number;
 }
 
 export function buildPodManifest(i: PodSpecInput): V1Pod {
@@ -23,6 +24,11 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
       restartPolicy: "Never",
       activeDeadlineSeconds: i.activeDeadlineSeconds,
       automountServiceAccountToken: false, // an agent needs no k8s API access
+      securityContext: {
+        runAsNonRoot: true,
+        runAsUser: i.runAsUser,
+        seccompProfile: { type: "RuntimeDefault" },
+      },
       volumes: [{ name: "workspace", emptyDir: {} }],
       containers: [
         {
@@ -32,6 +38,10 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
           workingDir: i.cwd,
           env: Object.entries(i.env).map(([name, value]) => ({ name, value })),
           volumeMounts: [{ name: "workspace", mountPath: i.cwd }],
+          securityContext: {
+            allowPrivilegeEscalation: false,
+            capabilities: { drop: ["ALL"] },
+          },
         },
       ],
     },

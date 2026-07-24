@@ -7,6 +7,7 @@ describe("buildPodManifest", () => {
     image: "ghcr.io/nearform/lastlight-sandbox:latest",
     command: ["sh", "-c", "echo hi"], env: { FOO: "bar" },
     cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800,
+    runAsUser: 10001,
   });
   it("targets the sandbox namespace and image", () => {
     expect(pod.metadata?.namespace).toBe("lastlight-sandboxes");
@@ -21,5 +22,25 @@ describe("buildPodManifest", () => {
   });
   it("carries inline env as name/value pairs", () => {
     expect(pod.spec?.containers[0].env).toContainEqual({ name: "FOO", value: "bar" });
+  });
+});
+
+describe("buildPodManifest securityContext", () => {
+  const pod = buildPodManifest({
+    name: "ll-x", namespace: "lastlight-sandboxes",
+    image: "ghcr.io/yo61/lastlight-sandbox:latest",
+    command: ["sh", "-c", "echo hi"], env: { FOO: "bar" },
+    cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800,
+    runAsUser: 10001,
+  });
+  it("sets a restricted-compliant pod securityContext", () => {
+    expect(pod.spec?.securityContext?.runAsNonRoot).toBe(true);
+    expect(pod.spec?.securityContext?.runAsUser).toBe(10001);
+    expect(pod.spec?.securityContext?.seccompProfile?.type).toBe("RuntimeDefault");
+  });
+  it("sets a restricted-compliant container securityContext", () => {
+    const c = pod.spec?.containers[0];
+    expect(c?.securityContext?.allowPrivilegeEscalation).toBe(false);
+    expect(c?.securityContext?.capabilities?.drop).toEqual(["ALL"]);
   });
 });
