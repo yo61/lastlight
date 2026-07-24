@@ -23,6 +23,22 @@ const WORKSPACE_DIR = "/home/agent/workspace";
 const POD_STATUS_POLL_ATTEMPTS = 15;
 const POD_STATUS_POLL_INTERVAL_MS = 500;
 
+/** Bound on the pre-stream "container started" poll. Image pull can take a
+ *  while on a cold node, so this budget (~60 × 1s ≈ 60s) is generous; a
+ *  terminal pull/config error fails fast within it (see FATAL_WAITING_REASONS). */
+const POD_START_POLL_ATTEMPTS = 60;
+const POD_START_POLL_INTERVAL_MS = 1000;
+
+/** Container `waiting.reason`s that will never resolve on their own — fail fast
+ *  with the reason instead of waiting out the whole start budget. */
+const FATAL_WAITING_REASONS = new Set([
+  "ImagePullBackOff",
+  "ErrImagePull",
+  "InvalidImageName",
+  "CreateContainerConfigError",
+  "CreateContainerError",
+]);
+
 /** Skeleton config the adapter needs; grows in later plans (namespace/image
  *  stay fixed here — the PVC, skill staging, and stdin/attach wiring land in
  *  Plans 2-3). */
@@ -160,7 +176,44 @@ export class KubernetesSandbox implements Sandbox {
       activeDeadlineSeconds: timeoutSeconds ?? this.opts.timeoutSeconds ?? 1800,
     });
     await this.apis.core.createNamespacedPod({ namespace: this.ns, body: manifest });
+    await this.waitForContainerStart(name);
     await streamPodLog(this.apis.log, this.ns, name, "agent", onLine);
+  }
+
+  /**
+   * Wait until the pod's container has started so the kubelet log endpoint is
+   * available. `Log.log(follow)` returns HTTP 400 while the container is still
+   * `waiting` (Pending / ContainerCreating / image pull), so streaming
+   * immediately after create races the scheduler. "Started" means the container
+   * is `running`/`terminated` OR the pod already reached a terminal phase (a
+   * fast command can finish before the first poll). A terminal image/config
+   * error (`ImagePullBackOff`, …) fails fast with its real reason rather than
+   * waiting out the budget, so the failure is debuggable instead of a cryptic 400.
+   */
+  private async waitForContainerStart(name: string): Promise<void> {
+    let lastReason = "";
+    for (let attempt = 0; attempt < POD_START_POLL_ATTEMPTS; attempt++) {
+      const pod = await this.apis.core.readNamespacedPodStatus({ name, namespace: this.ns });
+      const state = pod.status?.containerStatuses?.[0]?.state;
+      const phase = pod.status?.phase;
+      if (state?.running || state?.terminated || phase === "Succeeded" || phase === "Failed") {
+        return; // container has started (or already finished) — logs are available
+      }
+      const waiting = state?.waiting;
+      lastReason = waiting?.reason ?? phase ?? "";
+      if (waiting?.reason && FATAL_WAITING_REASONS.has(waiting.reason)) {
+        throw new Error(
+          `k8s sandbox pod ${name} cannot start: ${waiting.reason}` +
+            (waiting.message ? ` — ${waiting.message}` : ""),
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, POD_START_POLL_INTERVAL_MS));
+    }
+    const budgetSeconds = (POD_START_POLL_ATTEMPTS * POD_START_POLL_INTERVAL_MS) / 1000;
+    throw new Error(
+      `k8s sandbox pod ${name} container did not start within ${budgetSeconds}s ` +
+        `(last state: ${lastReason || "unknown"})`,
+    );
   }
 
   async dispose(): Promise<void> {

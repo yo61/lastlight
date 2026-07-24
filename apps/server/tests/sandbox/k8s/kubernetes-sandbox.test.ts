@@ -103,6 +103,22 @@ describe("KubernetesSandbox", () => {
     expect(res.timedOut).toBe(true);
   });
 
+  it("fails fast with the real reason when the container can't start (ImagePullBackOff)", async () => {
+    const { apis } = fakeApis({
+      status: {
+        phase: "Pending",
+        containerStatuses: [
+          { state: { waiting: { reason: "ImagePullBackOff", message: 'back-off pulling image "nope"' } } },
+        ],
+      },
+    });
+    const sbx = new KubernetesSandbox(factoryOpts, { namespace: "ns", image: "nope", apis });
+    await sbx.provision();
+    await expect(
+      sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any),
+    ).rejects.toThrow(/ImagePullBackOff/);
+  });
+
   it("dispose swallows a delete failure", async () => {
     const { apis } = fakeApis({ deleteThrows: true });
     const sbx = new KubernetesSandbox(factoryOpts, { namespace: "ns", image: "img", apis });
