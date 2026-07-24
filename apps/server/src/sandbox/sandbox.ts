@@ -10,6 +10,8 @@ import type { DockerSandbox as DockerDriver } from "./docker.js";
 import { SmolSandbox as SmolDriver, smolAvailable, SMOL_WORKSPACE_DIR } from "./smol.js";
 import { ALLOW_ALL_SENTINEL } from "./egress-allowlist.js";
 import { getDockerSandboxOtelEnv, getOtelEnvForSandbox } from "../telemetry/index.js";
+import { KubernetesSandbox } from "./k8s/kubernetes-sandbox.js";
+import { SANDBOX_IMAGE } from "./images.js";
 import {
   DOCKER_WORKSPACE_DIR,
   SKILL_BUNDLE_ROOT,
@@ -235,7 +237,10 @@ export function sandboxFor(backend: SandboxBackend, opts: SandboxFactoryOpts): S
     case "none":
       return new InProcessSandbox("none", opts);
     case "kubernetes":
-      throw new Error("kubernetes sandbox backend not yet available (implemented in Plan 1 Task 6)");
+      return new KubernetesSandbox(opts, {
+        namespace: process.env.LASTLIGHT_K8S_NAMESPACE ?? "lastlight-sandboxes",
+        image: opts.imageName ?? SANDBOX_IMAGE,
+      });
   }
 }
 
@@ -680,7 +685,7 @@ function asError(e: Error | string): Error {
  * subprocess (docker/smol) drivers: apply the cheap `{`-prefix guard, parse
  * JSON, and forward the parsed record. Non-JSON / malformed lines are dropped.
  */
-function parseLine(onEvent: (record: SandboxEvent) => void): (line: string) => void {
+export function parseLine(onEvent: (record: SandboxEvent) => void): (line: string) => void {
   return (line: string) => {
     if (!line.startsWith("{")) return;
     let record: SandboxEvent;
