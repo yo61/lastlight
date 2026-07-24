@@ -1,5 +1,8 @@
 import type { V1Pod } from "@kubernetes/client-node";
 
+export const PROMPT_MOUNT_DIR = "/lastlight";
+export const PROMPT_FILE = `${PROMPT_MOUNT_DIR}/prompt`;
+
 export interface PodSpecInput {
   name: string;
   namespace: string;
@@ -11,6 +14,9 @@ export interface PodSpecInput {
   cwd: string;
   activeDeadlineSeconds: number;
   runAsUser: number;
+  /** Name of the per-run prompt Secret; when set, mounts its `prompt` key as a file at
+   *  `PROMPT_FILE` so the entrypoint can pipe it into stdin (Task 6). */
+  promptSecret?: string;
 }
 
 export function buildPodManifest(i: PodSpecInput): V1Pod {
@@ -31,7 +37,12 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
         runAsUser: i.runAsUser,
         seccompProfile: { type: "RuntimeDefault" },
       },
-      volumes: [{ name: "workspace", emptyDir: {} }],
+      volumes: [
+        { name: "workspace", emptyDir: {} },
+        ...(i.promptSecret
+          ? [{ name: "prompt", secret: { secretName: i.promptSecret, items: [{ key: "prompt", path: "prompt" }] } }]
+          : []),
+      ],
       containers: [
         {
           name: "agent",
@@ -40,7 +51,10 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
           workingDir: i.cwd,
           // env now arrives from the per-run creds Secret — never inline (kubectl-visible).
           envFrom: [{ secretRef: { name: i.envFromSecret } }],
-          volumeMounts: [{ name: "workspace", mountPath: i.cwd }],
+          volumeMounts: [
+            { name: "workspace", mountPath: i.cwd },
+            ...(i.promptSecret ? [{ name: "prompt", mountPath: PROMPT_MOUNT_DIR, readOnly: true }] : []),
+          ],
           securityContext: {
             allowPrivilegeEscalation: false,
             capabilities: { drop: ["ALL"] },

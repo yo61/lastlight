@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildPodManifest } from "#src/sandbox/k8s/pod.js";
+import { buildPodManifest, PROMPT_FILE } from "#src/sandbox/k8s/pod.js";
 
 describe("buildPodManifest", () => {
   const pod = buildPodManifest({
@@ -53,5 +53,32 @@ describe("buildPodManifest creds via envFrom", () => {
     const c = pod.spec?.containers[0];
     expect(c?.envFrom).toContainEqual({ secretRef: { name: "ll-x-creds" } });
     expect(c?.env).toBeUndefined();
+  });
+});
+
+describe("buildPodManifest prompt mount", () => {
+  it("mounts the prompt Secret's `prompt` key as a read-only file when set", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "lastlight-sandboxes", image: "img",
+      command: ["sh", "-c", "exec agentic-pi run --model m --sandbox none --no-session < " + PROMPT_FILE],
+      envFromSecret: "ll-x-creds", promptSecret: "ll-x-prompt",
+      cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800, runAsUser: 10001,
+    });
+    const vol = pod.spec?.volumes?.find((v) => v.name === "prompt");
+    expect(vol?.secret).toMatchObject({
+      secretName: "ll-x-prompt",
+      items: [{ key: "prompt", path: "prompt" }],
+    });
+    const mount = pod.spec?.containers[0].volumeMounts?.find((m) => m.name === "prompt");
+    expect(mount).toMatchObject({ mountPath: "/lastlight", readOnly: true });
+  });
+
+  it("omits the prompt volume when no promptSecret is given (runCommand path)", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "lastlight-sandboxes", image: "img",
+      command: ["sh", "-c", "echo hi"], envFromSecret: "ll-x-creds",
+      cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800, runAsUser: 10001,
+    });
+    expect(pod.spec?.volumes?.some((v) => v.name === "prompt")).toBe(false);
   });
 });
