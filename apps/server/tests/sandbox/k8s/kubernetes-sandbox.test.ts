@@ -13,6 +13,8 @@ function fakeApis(opts: FakeOpts = {}) {
   const status = opts.status ?? { phase: "Succeeded" };
   const created: any[] = [];
   const deleted: string[] = [];
+  const secretsCreated: any[] = [];
+  const secretsDeleted: string[] = [];
   return {
     apis: {
       core: {
@@ -24,6 +26,14 @@ function fakeApis(opts: FakeOpts = {}) {
         deleteNamespacedPod: vi.fn(async ({ name }: any) => {
           if (opts.deleteThrows) throw new Error("boom");
           deleted.push(name);
+          return {};
+        }),
+        createNamespacedSecret: vi.fn(async ({ body }: any) => {
+          secretsCreated.push(body);
+          return body;
+        }),
+        deleteNamespacedSecret: vi.fn(async ({ name }: any) => {
+          secretsDeleted.push(name);
           return {};
         }),
       },
@@ -38,6 +48,8 @@ function fakeApis(opts: FakeOpts = {}) {
     } as any,
     created,
     deleted,
+    secretsCreated,
+    secretsDeleted,
   };
 }
 
@@ -51,7 +63,7 @@ const factoryOpts = {
 
 describe("KubernetesSandbox", () => {
   it("runAgent creates a pod, streams parsed events, and deletes the pod", async () => {
-    const { apis, created, deleted } = fakeApis();
+    const { apis, created, deleted, secretsCreated, secretsDeleted } = fakeApis();
     const sbx = new KubernetesSandbox(factoryOpts, {
       namespace: "lastlight-sandboxes",
       image: "img",
@@ -62,13 +74,27 @@ describe("KubernetesSandbox", () => {
     await sbx.runAgent(
       "t1",
       "hello",
-      { model: "openai/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace" } as any,
+      {
+        model: "openai/x",
+        sandboxEnv: { GITHUB_TOKEN: "ghs_abc" },
+        agentCwd: "/home/agent/workspace",
+      } as any,
       (e) => events.push(e),
     );
     expect(created).toHaveLength(1);
     expect(events).toContainEqual({ type: "agent_end" });
+
+    // Per-run creds arrive via the pod's own Secret, never as inline env
+    // (kubectl-visible) on the pod spec.
+    expect(secretsCreated).toHaveLength(1);
+    expect(secretsCreated[0].stringData).toMatchObject({ GITHUB_TOKEN: "ghs_abc" });
+    const container = created[0].spec.containers[0];
+    expect(container.env).toBeUndefined();
+    expect(container.envFrom).toContainEqual({ secretRef: { name: secretsCreated[0].metadata.name } });
+
     await sbx.dispose();
     expect(deleted).toHaveLength(1);
+    expect(secretsDeleted).toHaveLength(1);
   });
 
   it("runCommand returns the container's real exit code (0)", async () => {

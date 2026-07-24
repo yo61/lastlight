@@ -13,6 +13,7 @@ import { parseLine } from "../sandbox.js";
 import type { SandboxBackend } from "../../config/config.js";
 import { makeK8sApis, type K8sApis } from "./client.js";
 import { buildPodManifest } from "./pod.js";
+import { buildSecretManifest, secretNameFor } from "./secret.js";
 import { podNameFor } from "./naming.js";
 import { streamPodLog } from "./log-stream.js";
 
@@ -77,6 +78,7 @@ export class KubernetesSandbox implements Sandbox {
   // Stopgap default until Task 6 finalizes cluster-wide runAsUser wiring.
   private readonly runAsUser: number;
   private activePod?: string;
+  private activeCredsSecret?: string;
 
   constructor(
     private readonly opts: SandboxFactoryOpts,
@@ -176,6 +178,23 @@ export class KubernetesSandbox implements Sandbox {
   ): Promise<void> {
     const name = podNameFor(taskId, "run");
     this.activePod = name;
+
+    // Per-run creds travel in the pod's OWN Secret, never inline on the pod
+    // spec (inline env is `kubectl get pod -o yaml`-visible — issue #223).
+    // Must be created BEFORE the pod: a pod whose envFrom names a missing
+    // Secret fails to start.
+    const credsName = secretNameFor(name, "creds");
+    this.activeCredsSecret = credsName;
+    await this.apis.core.createNamespacedSecret({
+      namespace: this.ns,
+      body: buildSecretManifest({
+        name: credsName,
+        namespace: this.ns,
+        data: env,
+        labels: { "lastlight.io/pod": name },
+      }),
+    });
+
     // Wall-clock cap: activeDeadlineSeconds kills the pod at the per-call
     // budget (runCommand threads its RunCommandOpts.timeoutSeconds; runAgent
     // falls through to the factory timeout). streamPodLog resolves once the pod
@@ -185,7 +204,7 @@ export class KubernetesSandbox implements Sandbox {
       namespace: this.ns,
       image: this.image,
       command,
-      env,
+      envFromSecret: credsName,
       cwd,
       activeDeadlineSeconds: timeoutSeconds ?? this.opts.timeoutSeconds ?? 1800,
       runAsUser: this.runAsUser,
@@ -232,12 +251,24 @@ export class KubernetesSandbox implements Sandbox {
   }
 
   async dispose(): Promise<void> {
-    if (!this.activePod) return;
-    try {
-      await this.apis.core.deleteNamespacedPod({ name: this.activePod, namespace: this.ns });
-    } catch {
-      /* already gone — the reclaim sweep (Plan 4) is the backstop */
+    if (this.activePod) {
+      try {
+        await this.apis.core.deleteNamespacedPod({ name: this.activePod, namespace: this.ns });
+      } catch {
+        /* already gone — the reclaim sweep (Plan 4) is the backstop */
+      }
+      this.activePod = undefined;
     }
-    this.activePod = undefined;
+    if (this.activeCredsSecret) {
+      try {
+        await this.apis.core.deleteNamespacedSecret({
+          name: this.activeCredsSecret,
+          namespace: this.ns,
+        });
+      } catch {
+        /* already gone (cascade-GC'd with the pod, or the reclaim sweep) */
+      }
+      this.activeCredsSecret = undefined;
+    }
   }
 }

@@ -5,7 +5,9 @@ export interface PodSpecInput {
   namespace: string;
   image: string;
   command: string[];
-  env: Record<string, string>;
+  /** Name of the per-run creds Secret (see `secret.ts`); env arrives via
+   *  `envFrom`, never inline (inline env is `kubectl get pod -o yaml`-visible). */
+  envFromSecret: string;
   cwd: string;
   activeDeadlineSeconds: number;
   runAsUser: number;
@@ -36,7 +38,8 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
           image: i.image,
           command: i.command,
           workingDir: i.cwd,
-          env: Object.entries(i.env).map(([name, value]) => ({ name, value })),
+          // env now arrives from the per-run creds Secret — never inline (kubectl-visible).
+          envFrom: [{ secretRef: { name: i.envFromSecret } }],
           volumeMounts: [{ name: "workspace", mountPath: i.cwd }],
           securityContext: {
             allowPrivilegeEscalation: false,
