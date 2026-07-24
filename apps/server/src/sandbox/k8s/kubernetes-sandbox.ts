@@ -18,6 +18,11 @@ import { streamPodLog } from "./log-stream.js";
 
 const WORKSPACE_DIR = "/home/agent/workspace";
 
+/** Bound on the post-stream status poll: ~15 × 500ms ≈ 8s before the coarse
+ *  phase-based fallback, so a lagging kubelet status never hangs a command. */
+const POD_STATUS_POLL_ATTEMPTS = 15;
+const POD_STATUS_POLL_INTERVAL_MS = 500;
+
 /** Skeleton config the adapter needs; grows in later plans (namespace/image
  *  stay fixed here — the PVC, skill staging, and stdin/attach wiring land in
  *  Plans 2-3). */
@@ -97,13 +102,38 @@ export class KubernetesSandbox implements Sandbox {
       (line) => {
         stdout += line + "\n";
       },
+      opts.timeoutSeconds,
     );
-    const pod = await this.apis.core.readNamespacedPodStatus({
-      name: this.activePod!,
-      namespace: this.ns,
-    });
-    const ok = pod.status?.phase === "Succeeded";
-    return { exitCode: ok ? 0 : 1, stdout, stderr: "", timedOut: false };
+    const { exitCode, timedOut } = await this.awaitPodResult(this.activePod!);
+    return { exitCode, stdout, stderr: "", timedOut };
+  }
+
+  /**
+   * Resolve a finished pod to its real exit code + deadline flag. The log
+   * stream closing does not guarantee the API-visible status has left
+   * `Running` (kubelet status-sync lag), so we poll `readNamespacedPodStatus`
+   * until the pod is terminal, then read the container's `terminated.exitCode`.
+   * The loop is bounded (~15 × 500ms ≈ 8s) so a stuck status never hangs the
+   * command; on exhaustion we fall back to the coarse phase-based result.
+   */
+  private async awaitPodResult(name: string): Promise<{ exitCode: number; timedOut: boolean }> {
+    for (let attempt = 0; attempt < POD_STATUS_POLL_ATTEMPTS; attempt++) {
+      const pod = await this.apis.core.readNamespacedPodStatus({ name, namespace: this.ns });
+      const status = pod.status;
+      const terminated = status?.containerStatuses?.[0]?.state?.terminated;
+      const phase = status?.phase;
+      const isTerminal = terminated !== undefined || phase === "Succeeded" || phase === "Failed";
+      if (isTerminal) {
+        const timedOut =
+          status?.reason === "DeadlineExceeded" || terminated?.reason === "DeadlineExceeded";
+        const exitCode = terminated ? terminated.exitCode : phase === "Succeeded" ? 0 : 1;
+        return { exitCode, timedOut };
+      }
+      await new Promise((resolve) => setTimeout(resolve, POD_STATUS_POLL_INTERVAL_MS));
+    }
+    // Status never went terminal within the budget — coarse phase fallback.
+    const pod = await this.apis.core.readNamespacedPodStatus({ name, namespace: this.ns });
+    return { exitCode: pod.status?.phase === "Succeeded" ? 0 : 1, timedOut: false };
   }
 
   private async runPod(
@@ -112,12 +142,14 @@ export class KubernetesSandbox implements Sandbox {
     env: Record<string, string>,
     cwd: string,
     onLine: (line: string) => void,
+    timeoutSeconds?: number,
   ): Promise<void> {
     const name = podNameFor(taskId, "run");
     this.activePod = name;
-    // Wall-clock cap: activeDeadlineSeconds kills the pod at the phase timeout;
-    // streamPodLog resolves once the pod (and its log stream) terminates, so no
-    // separate timeout is needed here.
+    // Wall-clock cap: activeDeadlineSeconds kills the pod at the per-call
+    // budget (runCommand threads its RunCommandOpts.timeoutSeconds; runAgent
+    // falls through to the factory timeout). streamPodLog resolves once the pod
+    // (and its log stream) terminates, so no separate timeout is needed here.
     const manifest = buildPodManifest({
       name,
       namespace: this.ns,
@@ -125,7 +157,7 @@ export class KubernetesSandbox implements Sandbox {
       command,
       env,
       cwd,
-      activeDeadlineSeconds: this.opts.timeoutSeconds ?? 1800,
+      activeDeadlineSeconds: timeoutSeconds ?? this.opts.timeoutSeconds ?? 1800,
     });
     await this.apis.core.createNamespacedPod({ namespace: this.ns, body: manifest });
     await streamPodLog(this.apis.log, this.ns, name, "agent", onLine);

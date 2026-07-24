@@ -11,4 +11,13 @@ describe("podNameFor", () => {
   it("is deterministic for the same input", () => {
     expect(podNameFor("t", "run")).toBe(podNameFor("t", "run"));
   });
+  it.each([
+    ["empty string", ""],
+    ["symbol-only", "###/@@@"],
+    ["over-63-char taskId", "x".repeat(200)],
+  ])("produces a valid RFC-1123 label for %s", (_label, taskId) => {
+    const name = podNameFor(taskId, "run");
+    expect(name).toMatch(/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/);
+    expect(name.length).toBeLessThanOrEqual(63);
+  });
 });
