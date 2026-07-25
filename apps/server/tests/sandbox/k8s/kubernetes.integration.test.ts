@@ -78,7 +78,11 @@ describe.runIf(RUN)("KubernetesSandbox Plan 2 (integration)", () => {
   it(
     "clones a public repo into the PVC and runs a command against it",
     async () => {
-      const sbx = mkSbx(`it-clone-${Date.now()}`, {
+      // The pod name derives from the runCommand/runAgent taskId arg, so it
+      // must be unique per case — else back-to-back cases collide on a pod name
+      // whose prior instance is still terminating (409 AlreadyExists).
+      const taskId = `it-clone-${Date.now()}`;
+      const sbx = mkSbx(taskId, {
         GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? "",
       });
       try {
@@ -89,7 +93,7 @@ describe.runIf(RUN)("KubernetesSandbox Plan 2 (integration)", () => {
           token: process.env.GITHUB_TOKEN ?? "",
         } as any);
         const res = await sbx.runCommand(
-          "it",
+          taskId,
           "cat README && git -C . rev-parse --abbrev-ref HEAD",
           {
             cwd: "/home/agent/workspace/Hello-World",
@@ -108,7 +112,8 @@ describe.runIf(RUN)("KubernetesSandbox Plan 2 (integration)", () => {
   it.runIf(HAS_AI)(
     "runs an AI phase whose prompt arrives via the mounted Secret",
     async () => {
-      const sbx = mkSbx(`it-ai-${Date.now()}`, {
+      const taskId = `it-ai-${Date.now()}`;
+      const sbx = mkSbx(taskId, {
         GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? "",
         ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY!,
       });
@@ -121,7 +126,7 @@ describe.runIf(RUN)("KubernetesSandbox Plan 2 (integration)", () => {
           token: process.env.GITHUB_TOKEN ?? "",
         } as any);
         await sbx.runAgent(
-          "it",
+          taskId,
           "Reply with exactly the word PONG and nothing else.",
           {
             model: "anthropic/claude-haiku-4-5-20251001",
