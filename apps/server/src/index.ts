@@ -17,6 +17,7 @@ import { CronScheduler, type WorkflowRunner } from "./cron/scheduler.js";
 import { getJobs } from "./cron/jobs.js";
 import { dispatchCronWorkflow, fanOutContexts } from "./cron/fanout.js";
 import { sweepSandboxes } from "./cron/sandbox-sweep.js";
+import { sweepK8sSandboxes } from "./sandbox/k8s/sweep.js";
 import {
   discoverGreenDependencyPrs,
   discoverRedDependencyPrs,
@@ -1184,12 +1185,22 @@ async function main() {
   // Reap-on-completion (workflows/simple.ts) handles the common case; this
   // sweeps failed/crashed leftovers and bounds the reusable per-PR cache. It
   // replaces the out-of-band host cron (scripts/cleanup-sandboxes.sh).
+  // The `kubernetes` backend has no host clones to sweep — it reclaims idle
+  // PVCs instead (Plan 5, `sweepK8sSandboxes`); every other backend keeps the
+  // original host-dir sweep.
   const sweepCfg = config.cleanup.sandbox;
   if (sweepCfg.enabled) {
     cron.registerDirect({
       name: "sandbox-sweep",
       schedule: sweepCfg.sweepSchedule,
       handler: async () => {
+        if (config.sandbox === "kubernetes") {
+          await sweepK8sSandboxes({
+            retentionHours: sweepCfg.retentionHours,
+            maxIdlePVCs: sweepCfg.maxDirs,
+          });
+          return;
+        }
         sweepSandboxes({
           stateDir: config.stateDir,
           sandboxDir: config.sandboxDir,
