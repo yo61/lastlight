@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
+import { ApiException } from "@kubernetes/client-node";
+import type { V1PersistentVolumeClaim } from "@kubernetes/client-node";
 import { KubernetesSandbox } from "#src/sandbox/k8s/kubernetes-sandbox.js";
-import { makeK8sApis } from "#src/sandbox/k8s/client.js";
+import { makeK8sApis, type K8sApis } from "#src/sandbox/k8s/client.js";
+import { reclaimSandbox } from "#src/sandbox/k8s/reclaim.js";
+import { pvcNameFor } from "#src/sandbox/k8s/pvc.js";
+import { podNameFor, sanitizeLabelValue } from "#src/sandbox/k8s/naming.js";
+import { RUN_ID_LABEL } from "#src/sandbox/k8s/pod.js";
 import {
   CILIUM_CNP_PLURAL,
   CILIUM_GROUP,
@@ -34,6 +40,47 @@ async function strictPolicyPresent(namespace: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Read a PVC by name; `null` on 404 (gone), rethrow anything else. */
+async function readPvc(
+  apis: K8sApis,
+  namespace: string,
+  name: string,
+): Promise<V1PersistentVolumeClaim | null> {
+  try {
+    return await apis.core.readNamespacedPersistentVolumeClaim({ name, namespace });
+  } catch (err) {
+    if (err instanceof ApiException && err.code === 404) return null;
+    throw err;
+  }
+}
+
+/** True when a captured `reclaimSandbox` warning indicates the list RBAC
+ *  (Plan 7) isn't granted yet — the only 403 `reclaimSandbox` itself warns
+ *  about (a delete 403 warns too, but list 403s first and short-circuits
+ *  before any delete is attempted, so this single check covers both). */
+function rbacMissing(warnings: string[]): boolean {
+  return warnings.some((w) => w.includes("RBAC"));
+}
+
+/** Poll until `name` exists with phase Pending/Running (i.e. "live" per
+ *  `reclaimSandbox`'s own `isLive`) — Pending counts, so this resolves as
+ *  soon as the Pod object is created, well before it's actually scheduled. */
+async function waitForPodLive(apis: K8sApis, namespace: string, name: string): Promise<void> {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    try {
+      const pod = await apis.core.readNamespacedPodStatus({ name, namespace });
+      const phase = pod.status?.phase;
+      if ((phase === "Pending" || phase === "Running") && !pod.metadata?.deletionTimestamp) {
+        return;
+      }
+    } catch {
+      /* not created yet — keep polling */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`pod ${name} never reached Pending/Running within budget`);
 }
 
 describe.runIf(RUN)("KubernetesSandbox Plan 1 (integration)", () => {
@@ -254,6 +301,158 @@ describe.runIf(RUN)("KubernetesSandbox Plan 3 egress (integration)", () => {
         expect(result.stdout).toContain("evil=BLOCKED"); // non-allowlisted → denied
       } finally {
         await sbx.dispose();
+      }
+    },
+    180_000,
+  );
+});
+
+describe.runIf(RUN)("KubernetesSandbox Plan 5 reclaim (integration)", () => {
+  const NAMESPACE = process.env.LASTLIGHT_K8S_NAMESPACE ?? "lastlight-sandboxes";
+
+  const mkSbx = (taskId: string) =>
+    new KubernetesSandbox(
+      {
+        taskId,
+        egress: { unrestricted: false, hosts: [] },
+        env: { GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? "" },
+        stateDir: "/tmp",
+        timeoutSeconds: 180,
+      } as any,
+      {
+        namespace: NAMESPACE,
+        image: IMAGE,
+        storageClassName: process.env.LASTLIGHT_K8S_STORAGE_CLASS ??
+          "truenas-iscsi",
+        workspaceSize: "2Gi",
+        runAsUser: parseInt(
+          process.env.LASTLIGHT_K8S_RUN_AS_USER ?? "10001",
+          10,
+        ),
+        harnessEndpoint: HARNESS_ENDPOINT,
+        harnessNamespace: HARNESS_NAMESPACE,
+        harnessPodLabels: HARNESS_POD_LABELS,
+      },
+    );
+
+  it(
+    "reclaim-by-run deletes the run's PVC after dispose",
+    async () => {
+      // Unique per case, same collision reasoning as the Plan 2/3 cases.
+      const taskId = `it-reclaim-run-${Date.now()}`;
+      const runId = `it-reclaim-run-id-${Date.now()}`;
+      const sanitizedRunId = sanitizeLabelValue(runId);
+      const claimName = pvcNameFor(taskId);
+      const apis = makeK8sApis();
+      const sbx = mkSbx(taskId);
+
+      try {
+        // A pre-clone descriptor is what makes `provision()` create a
+        // PVC-backed workspace (Case A needs the PVC to survive dispose).
+        await sbx.provision({
+          owner: "octocat",
+          repo: "Hello-World",
+          branch: "master",
+          token: process.env.GITHUB_TOKEN ?? "",
+          runId,
+        } as any);
+        const res = await sbx.runCommand(taskId, "echo hi", {
+          cwd: "/home/agent/workspace/Hello-World",
+          timeoutSeconds: 60,
+        });
+        expect(res.exitCode).toBe(0);
+      } finally {
+        await sbx.dispose();
+      }
+
+      // dispose() only tears down the Pod (+ Secrets) — the PVC is
+      // reclaimSandbox's job, so it must still be here, labelled with the
+      // run-id Task 1 stamped onto it.
+      const afterDispose = await readPvc(apis, NAMESPACE, claimName);
+      expect(afterDispose?.metadata?.labels?.[RUN_ID_LABEL]).toBe(sanitizedRunId);
+
+      const warnings: string[] = [];
+      const result = await reclaimSandbox(
+        apis,
+        NAMESPACE,
+        { kind: "run", runId: sanitizedRunId },
+        { onWarn: (m) => warnings.push(m) },
+      );
+
+      if (rbacMissing(warnings)) {
+        console.warn(
+          "[IT] reclaimSandbox list RBAC not granted (Plan 7); " +
+            "skipping deletion assertion",
+        );
+        return;
+      }
+
+      expect(result.pvcsDeleted).toBeGreaterThanOrEqual(1);
+      expect(await readPvc(apis, NAMESPACE, claimName)).toBeNull();
+    },
+    180_000,
+  );
+
+  it(
+    "sweep skips a PVC still mounted by a live pod",
+    async () => {
+      const taskId = `it-reclaim-sweep-${Date.now()}`;
+      const runId = `it-reclaim-sweep-id-${Date.now()}`;
+      const claimName = pvcNameFor(taskId);
+      const podName = podNameFor(taskId, "run");
+      const apis = makeK8sApis();
+      const sbx = mkSbx(taskId);
+
+      await sbx.provision({
+        owner: "octocat",
+        repo: "Hello-World",
+        branch: "master",
+        token: process.env.GITHUB_TOKEN ?? "",
+        runId,
+      } as any);
+
+      // Fire-and-forget: runCommand/runAgent block until the pod finishes, so
+      // the only way to hold a pod genuinely live mid-test is to NOT await
+      // this call. `dispose()` below deletes the pod out from under it,
+      // which makes its log-stream/status-poll reject — expected, not a
+      // failure, so swallow it here and await the settled promise in
+      // `finally` (bounded, in case the stream is ever slow to close).
+      const bg = sbx
+        .runCommand(taskId, "sleep 120", {
+          cwd: "/home/agent/workspace/Hello-World",
+          timeoutSeconds: 150,
+        })
+        .catch(() => undefined);
+
+      try {
+        await waitForPodLive(apis, NAMESPACE, podName);
+
+        const warnings: string[] = [];
+        // staleByHours: 0 + maxIdlePVCs: 0 forces every idle PVC in the
+        // namespace into "would reclaim" — so this also reclaims any other
+        // idle PVC left over in NAMESPACE. Only the live pod's own PVC is
+        // asserted on; that's the live-skip this case proves.
+        await reclaimSandbox(
+          apis,
+          NAMESPACE,
+          { kind: "sweep", staleByHours: 0, maxIdlePVCs: 0 },
+          { onWarn: (m) => warnings.push(m) },
+        );
+
+        if (rbacMissing(warnings)) {
+          console.warn(
+            "[IT] reclaimSandbox list RBAC not granted (Plan 7); " +
+              "skipping live-skip assertion",
+          );
+          return;
+        }
+
+        expect(await readPvc(apis, NAMESPACE, claimName)).not.toBeNull();
+      } finally {
+        await sbx.dispose();
+        await Promise.race([bg, new Promise((resolve) => setTimeout(resolve, 20_000))]);
+        // Now idle — a follow-up sweep removes it so the case doesn't leak.
+        await reclaimSandbox(apis, NAMESPACE, { kind: "sweep", staleByHours: 0, maxIdlePVCs: 0 });
       }
     },
     180_000,
