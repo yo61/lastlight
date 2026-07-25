@@ -131,8 +131,6 @@ export async function reclaimSandbox(
     throw err;
   }
 
-  const live = livePvcClaimNames(pods);
-
   const isSelectorPod = (p: V1Pod): boolean =>
     selector.kind === "run" && p.metadata?.labels?.[RUN_ID_LABEL] === selector.runId;
   const matchedPods = pods.filter(isSelectorPod);
@@ -143,7 +141,9 @@ export async function reclaimSandbox(
   // by the very pod we're about to delete. `sweep` uses the full live set —
   // it must never reclaim a PVC any live pod (of any run) still mounts.
   const liveForPvcs =
-    selector.kind === "run" ? livePvcClaimNames(pods.filter((p) => !isSelectorPod(p))) : live;
+    selector.kind === "run"
+      ? livePvcClaimNames(pods.filter((p) => !isSelectorPod(p)))
+      : livePvcClaimNames(pods);
 
   const matchedPvcs = pvcsToReclaim(pvcs, selector, liveForPvcs, now);
 

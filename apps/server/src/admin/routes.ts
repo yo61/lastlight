@@ -1476,18 +1476,22 @@ export function createAdminRoutes(
     }
     // Reap the workspace too (issue #106) — the kills above stop the in-flight
     // phase but leave the clone (or, on the `kubernetes` backend, the Pod +
-    // PVC) behind. Cancel is explicit and leaves a dirty checkout, so reap
-    // regardless of workflow class (a reusable per-PR dir just re-clones next
-    // time). The live-container guard defaults on, so a container still dying
-    // from the kills above is not raced.
+    // PVC) behind. Cancel is explicit and leaves a dirty checkout, so on the
+    // host backend reap regardless of workflow class (a reusable per-PR dir
+    // just re-clones next time). The live-container guard defaults on, so a
+    // container still dying from the kills above is not raced.
     let reaped = false;
     if (typeof storedTaskId === "string" && storedTaskId) {
       if (getRuntimeConfig()?.sandbox === "kubernetes") {
-        // No host clone to reap on this backend — reclaim the run's own Pod +
-        // PVC instead (Plan 5). `runId` must be sanitized identically to the
-        // label Task 1 stamped on those objects, or the selector matches
-        // nothing. Best-effort: an unreachable cluster / transport error must
-        // never fail the cancel response.
+        // On k8s, reclaim the run's pod + PVC by run-id label. An EPHEMERAL
+        // (per-run) PVC matches and is deleted. A REUSED per-(repo,PR) PVC
+        // keeps its first run's label, so it is intentionally left as a warm
+        // cache (issue #107) and reclaimed later by the age/LRU sweep —
+        // unlike the host reap above, which removes reused dirs on cancel.
+        // `runId` must be sanitized identically to the label Task 1 stamped
+        // on those objects, or the selector matches nothing. Best-effort: an
+        // unreachable cluster / transport error must never fail the cancel
+        // response.
         try {
           await reclaimSandbox(makeK8sApis(), resolveKubernetesConfig().namespace, {
             kind: "run",
