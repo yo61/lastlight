@@ -215,6 +215,31 @@ describe("KubernetesSandbox", () => {
     expect(apis.core.readNamespacedPodStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("appends the init container's logs so the real git error is visible", async () => {
+    const { apis } = fakeApis({
+      status: {
+        phase: "Pending",
+        containerStatuses: [{ state: { waiting: { reason: "PodInitializing" } } }],
+        initContainerStatuses: [
+          { name: "clone", state: { terminated: { exitCode: 128, reason: "Error" } } },
+        ],
+      },
+    });
+    apis.core.readNamespacedPodLog = vi.fn(
+      async () =>
+        "Cloning into '/home/agent/workspace/Hello-World'...\n" +
+        "fatal: could not create work tree dir: Permission denied",
+    ) as any;
+    const sbx = new KubernetesSandbox(factoryOpts, cfg(apis));
+    await sbx.provision();
+    await expect(
+      sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any),
+    ).rejects.toThrow(/Permission denied/);
+    expect(apis.core.readNamespacedPodLog).toHaveBeenCalledWith(
+      expect.objectContaining({ container: "clone" }),
+    );
+  });
+
   it("dispose swallows a delete failure", async () => {
     const { apis } = fakeApis({ deleteThrows: true });
     const sbx = new KubernetesSandbox(factoryOpts, cfg(apis));

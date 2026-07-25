@@ -372,7 +372,7 @@ export class KubernetesSandbox implements Sandbox {
     let lastReason = "";
     for (let attempt = 0; attempt < POD_START_POLL_ATTEMPTS; attempt++) {
       const pod = await this.apis.core.readNamespacedPodStatus({ name, namespace: this.ns });
-      this.checkInitContainerFailure(name, pod.status?.initContainerStatuses);
+      await this.checkInitContainerFailure(name, pod.status?.initContainerStatuses);
       const state = pod.status?.containerStatuses?.[0]?.state;
       const phase = pod.status?.phase;
       if (state?.running || state?.terminated || phase === "Succeeded" || phase === "Failed") {
@@ -402,17 +402,19 @@ export class KubernetesSandbox implements Sandbox {
    * uninformative `PodInitializing` (which is the NORMAL state while an
    * initContainer is still running — not itself a failure).
    */
-  private checkInitContainerFailure(
+  private async checkInitContainerFailure(
     podName: string,
     initStatuses: V1ContainerStatus[] | undefined,
-  ): void {
+  ): Promise<void> {
     for (const init of initStatuses ?? []) {
       const terminated = init.state?.terminated;
       if (terminated && terminated.exitCode !== 0) {
+        const logs = await this.initContainerLogs(podName, init.name);
         throw new Error(
           `k8s sandbox pod ${podName} init container "${init.name}" failed ` +
             `(exit ${terminated.exitCode}): ${terminated.reason ?? "unknown"}` +
-            (terminated.message ? ` — ${terminated.message}` : ""),
+            (terminated.message ? ` — ${terminated.message}` : "") +
+            (logs ? `\n--- ${init.name} logs (tail) ---\n${logs}` : ""),
         );
       }
       const waiting = init.state?.waiting;
@@ -422,6 +424,27 @@ export class KubernetesSandbox implements Sandbox {
             `${waiting.reason}` + (waiting.message ? ` — ${waiting.message}` : ""),
         );
       }
+    }
+  }
+
+  /**
+   * Best-effort tail of a terminated init container's logs, appended to the
+   * thrown error so the REAL failure (a git clone error — DNS, egress, PVC
+   * permission, auth) is visible instead of a bare `exit 128`. Never throws:
+   * a log-fetch failure just yields no extra detail.
+   */
+  private async initContainerLogs(podName: string, container: string): Promise<string> {
+    try {
+      const raw = await this.apis.core.readNamespacedPodLog({
+        name: podName,
+        namespace: this.ns,
+        container,
+      });
+      const text = typeof raw === "string" ? raw.trim() : "";
+      const MAX = 2000;
+      return text.length > MAX ? `…${text.slice(-MAX)}` : text;
+    } catch {
+      return "";
     }
   }
 
