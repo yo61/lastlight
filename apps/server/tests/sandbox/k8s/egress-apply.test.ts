@@ -45,4 +45,27 @@ describe("applyEgressPolicies", () => {
       code: 403,
     });
   });
+
+  it("applies the toEndpoints harness rule to both policies when harness is passed", async () => {
+    const create = vi.fn().mockResolvedValue({});
+    const custom = { createNamespacedCustomObject: create } as any;
+    const harness = {
+      namespace: "lastlight",
+      labels: { "app.kubernetes.io/name": "lastlight" },
+      port: 8644,
+    };
+    await applyEgressPolicies(custom, { namespace: "ns", hosts: ["github.com"], harness });
+    const bodies = create.mock.calls.map((c) => c[0].body);
+    for (const body of bodies) {
+      // DNS also uses toEndpoints (to kube-dns) — find the harness-labelled rule specifically.
+      const rule = body.spec.egress.find(
+        (r: any) => r.toEndpoints?.[0]?.matchLabels?.["app.kubernetes.io/name"] === "lastlight",
+      ) as any;
+      expect(rule.toEndpoints[0].matchLabels).toMatchObject({
+        "k8s:io.kubernetes.pod.namespace": "lastlight",
+        "app.kubernetes.io/name": "lastlight",
+      });
+      expect(rule.toPorts[0].ports).toContainEqual({ port: "8644", protocol: "TCP" });
+    }
+  });
 });

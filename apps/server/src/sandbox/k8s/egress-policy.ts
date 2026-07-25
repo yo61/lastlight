@@ -50,6 +50,25 @@ function dnsEgressRule(): unknown {
   };
 }
 
+/** The harness Pod the sandbox may reach for the skill fetch (design §4/§7). */
+export interface HarnessSelector {
+  namespace: string;
+  labels: Record<string, string>;
+  port: number;
+}
+
+/** Permit sandbox→harness only, by Cilium identity (namespace + labels), on the
+ *  harness port — an identity rule, not a CIDR hole. Carries the Section 7 skill
+ *  fetch under both strict and open. */
+function harnessEgressRule(h: HarnessSelector): unknown {
+  return {
+    toEndpoints: [
+      { matchLabels: { "k8s:io.kubernetes.pod.namespace": h.namespace, ...h.labels } },
+    ],
+    toPorts: [{ ports: [{ port: String(h.port), protocol: "TCP" }] }],
+  };
+}
+
 /** Minimal shape of a Cilium `CiliumNetworkPolicy` custom resource. */
 export interface CiliumNetworkPolicy {
   apiVersion: string;
@@ -90,18 +109,24 @@ function policy(
 }
 
 /** Strict = DNS + the allowlist FQDNs on 443/TCP; everything else default-denied. */
-export function renderStrictEgressPolicy(
-  opts: { namespace: string; hosts: readonly string[] },
-): CiliumNetworkPolicy {
+export function renderStrictEgressPolicy(opts: {
+  namespace: string;
+  hosts: readonly string[];
+  harness?: HarnessSelector;
+}): CiliumNetworkPolicy {
   const egress = [
     dnsEgressRule(),
     { toFQDNs: fqdnRulesFor(opts.hosts), toPorts: [{ ports: [{ port: "443", protocol: "TCP" }] }] },
   ];
+  if (opts.harness) egress.push(harnessEgressRule(opts.harness));
   return policy(STRICT_POLICY_NAME, opts.namespace, "strict", egress);
 }
 
 /** Open = DNS + broad 80/443 egress minus the private-CIDR SSRF floor. */
-export function renderOpenEgressPolicy(opts: { namespace: string }): CiliumNetworkPolicy {
+export function renderOpenEgressPolicy(opts: {
+  namespace: string;
+  harness?: HarnessSelector;
+}): CiliumNetworkPolicy {
   const egress = [
     dnsEgressRule(),
     {
@@ -112,6 +137,7 @@ export function renderOpenEgressPolicy(opts: { namespace: string }): CiliumNetwo
       toPorts: [{ ports: [{ port: "443", protocol: "TCP" }, { port: "80", protocol: "TCP" }] }],
     },
   ];
+  if (opts.harness) egress.push(harnessEgressRule(opts.harness));
   return policy(OPEN_POLICY_NAME, opts.namespace, "open", egress);
 }
 
@@ -119,9 +145,10 @@ export function renderOpenEgressPolicy(opts: { namespace: string }): CiliumNetwo
 export function renderEgressPolicies(opts: {
   namespace: string;
   hosts: readonly string[];
+  harness?: HarnessSelector;
 }): { strict: CiliumNetworkPolicy; open: CiliumNetworkPolicy } {
   return {
     strict: renderStrictEgressPolicy(opts),
-    open: renderOpenEgressPolicy({ namespace: opts.namespace }),
+    open: renderOpenEgressPolicy({ namespace: opts.namespace, harness: opts.harness }),
   };
 }

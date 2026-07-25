@@ -5,6 +5,7 @@ import {
   CILIUM_VERSION,
   renderEgressPolicies,
   type CiliumNetworkPolicy,
+  type HarnessSelector,
 } from "./egress-policy.js";
 
 /**
@@ -16,9 +17,13 @@ import {
  */
 export async function applyEgressPolicies(
   custom: CustomObjectsApi,
-  opts: { namespace: string; hosts: readonly string[] },
+  opts: { namespace: string; hosts: readonly string[]; harness?: HarnessSelector },
 ): Promise<void> {
-  const { strict, open } = renderEgressPolicies({ namespace: opts.namespace, hosts: opts.hosts });
+  const { strict, open } = renderEgressPolicies({
+    namespace: opts.namespace,
+    hosts: opts.hosts,
+    harness: opts.harness,
+  });
   await createOrReplace(custom, opts.namespace, strict);
   await createOrReplace(custom, opts.namespace, open);
 }

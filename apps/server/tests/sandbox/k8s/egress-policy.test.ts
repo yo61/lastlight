@@ -105,3 +105,54 @@ describe("renderEgressPolicies", () => {
     expect(open.metadata.namespace).toBe("ns");
   });
 });
+
+const harness = {
+  namespace: "lastlight",
+  labels: { "app.kubernetes.io/name": "lastlight" },
+  port: 8644,
+};
+
+describe("toEndpoints harness rule", () => {
+  it("strict permits sandbox→harness on the harness port (identity, not a CIDR hole)", () => {
+    const pol = renderStrictEgressPolicy({ namespace: "ns", hosts: ["github.com"], harness });
+    // DNS also uses toEndpoints (to kube-dns) — find the harness-labelled rule specifically.
+    const rule = pol.spec.egress.find(
+      (r: any) => r.toEndpoints?.[0]?.matchLabels?.["app.kubernetes.io/name"] === "lastlight",
+    ) as any;
+    expect(rule.toEndpoints[0].matchLabels).toMatchObject({
+      "k8s:io.kubernetes.pod.namespace": "lastlight",
+      "app.kubernetes.io/name": "lastlight",
+    });
+    expect(rule.toPorts[0].ports).toContainEqual({ port: "8644", protocol: "TCP" });
+    // still no CIDR escape hatch in strict
+    expect(pol.spec.egress.some((r: any) => r.toCIDRSet)).toBe(false);
+  });
+
+  it("open also carries the harness rule", () => {
+    const pol = renderOpenEgressPolicy({ namespace: "ns", harness });
+    expect(
+      pol.spec.egress.some(
+        (r: any) => r.toEndpoints?.[0]?.matchLabels?.["app.kubernetes.io/name"] === "lastlight",
+      ),
+    ).toBe(true);
+  });
+
+  it("renderEgressPolicies forwards harness to both strict and open", () => {
+    const { strict, open } = renderEgressPolicies({
+      namespace: "ns",
+      hosts: ["github.com"],
+      harness,
+    });
+    expect(strict.spec.egress.some((r: any) => r.toEndpoints)).toBe(true);
+    expect(open.spec.egress.some((r: any) => r.toEndpoints)).toBe(true);
+  });
+
+  it("omitted harness renders no toEndpoints-for-harness rule (Task-6 closes this)", () => {
+    const pol = renderStrictEgressPolicy({ namespace: "ns", hosts: ["github.com"] });
+    // the DNS rule also uses toEndpoints, so assert specifically no harness-labelled rule
+    const harnessRule = pol.spec.egress.find(
+      (r: any) => r.toEndpoints?.[0]?.matchLabels?.["app.kubernetes.io/name"] === "lastlight",
+    );
+    expect(harnessRule).toBeUndefined();
+  });
+});
