@@ -15,7 +15,11 @@ describe("applyEgressPolicies", () => {
     const names = create.mock.calls.map((c) => c[0].body.metadata.name);
     expect(names).toContain(STRICT_POLICY_NAME);
     expect(names).toContain(OPEN_POLICY_NAME);
-    expect(create.mock.calls[0][0]).toMatchObject({ group: "cilium.io", version: "v2", plural: "ciliumnetworkpolicies" });
+    expect(create.mock.calls[0][0]).toMatchObject({
+      group: "cilium.io",
+      version: "v2",
+      plural: "ciliumnetworkpolicies",
+    });
   });
 
   it("replaces an existing policy (409) after reading its resourceVersion", async () => {
@@ -35,7 +39,9 @@ describe("applyEgressPolicies", () => {
   it("propagates a non-409 error (e.g. 403 — the adapter decides to warn)", async () => {
     const create = vi.fn().mockRejectedValue(apiError(403));
     const custom = { createNamespacedCustomObject: create } as any;
-    await expect(applyEgressPolicies(custom, { namespace: "ns", hosts: ["github.com"] })).rejects.toMatchObject({
+    await expect(
+      applyEgressPolicies(custom, { namespace: "ns", hosts: ["github.com"] }),
+    ).rejects.toMatchObject({
       code: 403,
     });
   });

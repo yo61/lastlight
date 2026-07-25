@@ -28,13 +28,21 @@ async function createOrReplace(
   namespace: string,
   body: CiliumNetworkPolicy,
 ): Promise<void> {
-  const coords = { group: CILIUM_GROUP, version: CILIUM_VERSION, namespace, plural: CILIUM_CNP_PLURAL };
+  const coords = {
+    group: CILIUM_GROUP,
+    version: CILIUM_VERSION,
+    namespace,
+    plural: CILIUM_CNP_PLURAL,
+  };
   try {
     await custom.createNamespacedCustomObject({ ...coords, body });
   } catch (err) {
     if (!(err instanceof ApiException) || err.code !== 409) throw err;
     const name = body.metadata.name;
-    const current = (await custom.getNamespacedCustomObject({ ...coords, name })) as CiliumNetworkPolicy & {
+    const current = (await custom.getNamespacedCustomObject({
+      ...coords,
+      name,
+    })) as CiliumNetworkPolicy & {
       metadata: { resourceVersion?: string };
     };
     const withVersion = {
