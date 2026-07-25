@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { pvcNameFor, buildPvcManifest } from "#src/sandbox/k8s/pvc.js";
+import { RUN_ID_LABEL } from "#src/sandbox/k8s/pod.js";
 
 describe("pvcNameFor", () => {
   it("is a stable RFC-1123 ws- name (no per-run hash)", () => {
@@ -18,5 +19,12 @@ describe("buildPvcManifest", () => {
     expect(pvc.spec?.accessModes).toEqual(["ReadWriteOnce"]);
     expect(pvc.spec?.storageClassName).toBe("truenas-iscsi");
     expect(pvc.spec?.resources?.requests?.storage).toBe("5Gi");
+  });
+
+  it("labels the PVC with the run id when given", () => {
+    const pvc = buildPvcManifest({
+      name: "ws-x", namespace: "ns", storageClassName: "sc", size: "5Gi", runId: "run-42",
+    });
+    expect(pvc.metadata?.labels?.[RUN_ID_LABEL]).toBe("run-42");
   });
 });

@@ -1,4 +1,5 @@
 import type { V1PersistentVolumeClaim } from "@kubernetes/client-node";
+import { RUN_ID_LABEL } from "./pod.js";
 
 /** Stable per-(repo,PR) claim name — NO run/phase hash, so pods reuse it. */
 export function pvcNameFor(taskId: string): string {
@@ -8,6 +9,9 @@ export function pvcNameFor(taskId: string): string {
 
 export function buildPvcManifest(i: {
   name: string; namespace: string; storageClassName: string; size: string;
+  /** Sanitized run id (see `kubernetes-sandbox.ts`); when set, stamped as the
+   *  `RUN_ID_LABEL` so `reclaimSandbox` (Plan 5) can select this run's PVC. */
+  runId?: string;
 }): V1PersistentVolumeClaim {
   return {
     apiVersion: "v1",
@@ -17,6 +21,7 @@ export function buildPvcManifest(i: {
       labels: {
         "app.kubernetes.io/managed-by": "lastlight",
         "lastlight.io/component": "workspace",
+        ...(i.runId ? { [RUN_ID_LABEL]: i.runId } : {}),
       },
     },
     spec: {

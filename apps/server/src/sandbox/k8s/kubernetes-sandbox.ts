@@ -15,6 +15,7 @@ import { parseLine } from "../sandbox.js";
 import type { SandboxBackend } from "../../config/config.js";
 import { makeK8sApis, type K8sApis } from "./client.js";
 import { buildPodManifest, WORKSPACE_DIR, PROMPT_FILE, type PodSpecInput } from "./pod.js";
+import { sanitizeLabelValue } from "./naming.js";
 import { buildSecretManifest, podOwnerReference, secretNameFor } from "./secret.js";
 import { podNameFor } from "./naming.js";
 import { streamPodLog } from "./log-stream.js";
@@ -165,6 +166,7 @@ export class KubernetesSandbox implements Sandbox {
         namespace: this.ns,
         storageClassName: this.storageClassName,
         size: this.workspaceSize,
+        runId: this.sanitizedRunId(),
       }),
     });
   }
@@ -228,6 +230,14 @@ export class KubernetesSandbox implements Sandbox {
 
   sandboxPathFor(relPath: string): string {
     return `${WORKSPACE_DIR}/${relPath}`;
+  }
+
+  /** Sanitized `this.pre.runId` — stamped identically onto the Pod (`runPod`)
+   *  and the PVC (`ensurePvc`) as `RUN_ID_LABEL` so the reclaim run-selector
+   *  (Plan 5) matches both. Undefined when `provision()` had no pre-clone
+   *  descriptor, or the descriptor carried no runId. */
+  private sanitizedRunId(): string | undefined {
+    return this.pre?.runId ? sanitizeLabelValue(this.pre.runId) : undefined;
   }
 
   async runAgent(
@@ -404,6 +414,7 @@ export class KubernetesSandbox implements Sandbox {
       initContainers,
       egressPolicy: this.opts.egress.unrestricted ? "open" : "strict",
       skillsMount: this.skillToken !== undefined,
+      runId: this.sanitizedRunId(),
     });
     const created = await this.createPodOrCleanupSecrets(manifest, credsName, promptName);
     await this.patchSecretOwnerRefs(name, created, credsName, promptName);

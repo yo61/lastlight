@@ -5,6 +5,11 @@ import { SKILLS_MOUNT_DIR } from "./skill-bundle.js";
 export const PROMPT_MOUNT_DIR = "/lastlight";
 export const PROMPT_FILE = `${PROMPT_MOUNT_DIR}/prompt`;
 
+/** Label stamping a sandbox Pod/PVC with the run that owns it — the selector
+ *  `reclaimSandbox` (Plan 5) matches on to find a run's objects. `pvc.ts`
+ *  reuses this same constant so both objects carry an identical key. */
+export const RUN_ID_LABEL = "lastlight.io/run-id";
+
 /** Fixed in-pod mount root for the "workspace" volume — always the PVC/emptyDir
  *  ROOT, independent of `cwd` (which may be a `<root>/<repo>` subdir once a
  *  pre-clone init container has populated it). The clone initContainer mounts
@@ -43,6 +48,9 @@ export interface PodSpecInput {
    *  mount it at SKILLS_MOUNT_DIR in the agent container (the initContainer,
    *  passed in `initContainers`, unpacks the fetched bundle into it). */
   skillsMount?: boolean;
+  /** Sanitized run id (see `kubernetes-sandbox.ts`); when set, stamped as the
+   *  `RUN_ID_LABEL` so `reclaimSandbox` (Plan 5) can select this run's Pod. */
+  runId?: string;
 }
 
 export function buildPodManifest(i: PodSpecInput): V1Pod {
@@ -56,6 +64,7 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
         "app.kubernetes.io/managed-by": "lastlight",
         "lastlight.io/component": "sandbox",
         [EGRESS_POLICY_LABEL]: i.egressPolicy,
+        ...(i.runId ? { [RUN_ID_LABEL]: i.runId } : {}),
       },
     },
     spec: {
@@ -71,6 +80,11 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
         // ("could not create work tree dir: Permission denied"). Reuses the
         // runAsUser value as the group id (a standard non-root idiom).
         fsGroup: i.runAsUser,
+        // Skip the recursive chown when the volume's group already matches —
+        // matters on a REUSED PVC (Plan 2 deferral): without it every run pays
+        // a slow recursive chown over the whole checkout just to re-confirm
+        // ownership it already has.
+        fsGroupChangePolicy: "OnRootMismatch",
         seccompProfile: { type: "RuntimeDefault" },
       },
       volumes: [

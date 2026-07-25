@@ -21,3 +21,11 @@ export function podNameFor(taskId: string, phaseSuffix = "run"): string {
     .replace(/-+$/g, "");
   return `${base}-${hash}`;
 }
+
+/** RFC-1123 label VALUE: `[a-zA-Z0-9._-]`, ≤63 chars. Unlike `podNameFor`'s
+ *  label NAME rules this allows uppercase and `.` — but we lowercase anyway so
+ *  the pod and PVC (and later the reclaim run-selector) compare byte-for-byte
+ *  regardless of the source runId's casing. */
+export function sanitizeLabelValue(v: string): string {
+  return v.toLowerCase().replace(/[^a-z0-9._-]/g, "-").slice(0, 63);
+}

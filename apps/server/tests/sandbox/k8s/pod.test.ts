@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildPodManifest, PROMPT_FILE } from "#src/sandbox/k8s/pod.js";
+import { buildPodManifest, PROMPT_FILE, RUN_ID_LABEL } from "#src/sandbox/k8s/pod.js";
 import { EGRESS_POLICY_LABEL } from "#src/sandbox/k8s/egress-policy.js";
 import { SKILLS_MOUNT_DIR } from "#src/sandbox/k8s/skill-bundle.js";
 
@@ -174,5 +174,28 @@ describe("buildPodManifest skills mount", () => {
     });
     expect(pod.spec?.volumes?.some((v) => v.name === "skills")).toBe(false);
     expect(pod.spec?.containers[0].volumeMounts?.some((m) => m.name === "skills")).toBe(false);
+  });
+});
+
+describe("buildPodManifest run-id label + fsGroupChangePolicy", () => {
+  it("labels the pod with the run id and sets OnRootMismatch when runId is given", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict", runId: "run-42",
+    });
+    expect(pod.metadata?.labels?.[RUN_ID_LABEL]).toBe("run-42");
+    expect(pod.spec?.securityContext?.fsGroupChangePolicy).toBe("OnRootMismatch");
+  });
+  it("omits the run-id label when no runId, but still sets fsGroupChangePolicy", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict",
+    });
+    expect(pod.metadata?.labels?.[RUN_ID_LABEL]).toBeUndefined();
+    expect(pod.spec?.securityContext?.fsGroupChangePolicy).toBe("OnRootMismatch");
   });
 });
