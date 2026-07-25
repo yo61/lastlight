@@ -65,10 +65,7 @@ export function pvcsToReclaim(
     return created ? now - new Date(created).getTime() : 0;
   };
 
-  // staleByHours <= 0 disables the age pass (a caller-facing "off" sentinel —
-  // an actual 0h floor would trivially match every idle PVC), leaving only
-  // the LRU cap below.
-  const stale = selector.staleByHours > 0 ? idle.filter((p) => ageOf(p) > maxAgeMs) : [];
+  const stale = idle.filter((p) => ageOf(p) > maxAgeMs);
   const staleNames = new Set(stale.map((p) => p.metadata?.name));
   const survivors = idle.filter((p) => !staleNames.has(p.metadata?.name));
 

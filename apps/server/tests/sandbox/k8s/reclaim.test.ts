@@ -60,9 +60,10 @@ describe("pvcsToReclaim", () => {
     expect(out.map((p: any) => p.metadata.name)).toEqual(["old"]);
   });
   it("sweep LRU-evicts the oldest beyond maxIdlePVCs", () => {
+    // staleByHours huge so the age pass reclaims nothing — isolates LRU.
     const out = pvcsToReclaim(
       [pvc("o1", 3), pvc("o2", 2), pvc("o3", 1)] as any,
-      { kind: "sweep", staleByHours: 0, maxIdlePVCs: 1 },
+      { kind: "sweep", staleByHours: 1_000_000, maxIdlePVCs: 1 },
       new Set(),
       0,
     );
