@@ -21,6 +21,9 @@ describe.runIf(RUN)("KubernetesSandbox (integration)", () => {
         {
           namespace: process.env.LASTLIGHT_K8S_NAMESPACE ?? "lastlight-sandboxes",
           image: process.env.K8S_SANDBOX_IMAGE ?? "ghcr.io/nearform/lastlight-sandbox:latest",
+          storageClassName: process.env.K8S_SANDBOX_STORAGE_CLASS ?? "truenas-iscsi",
+          workspaceSize: process.env.K8S_SANDBOX_WORKSPACE_SIZE ?? "5Gi",
+          runAsUser: Number(process.env.K8S_SANDBOX_RUN_AS_USER ?? 10001),
         },
       );
       await sbx.provision();

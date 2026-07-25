@@ -1,4 +1,5 @@
 import { ApiException } from "@kubernetes/client-node";
+import type { V1Pod } from "@kubernetes/client-node";
 import type { RunResult } from "agentic-pi";
 import type {
   Sandbox,
@@ -13,8 +14,8 @@ import type {
 import { parseLine } from "../sandbox.js";
 import type { SandboxBackend } from "../../config/config.js";
 import { makeK8sApis, type K8sApis } from "./client.js";
-import { buildPodManifest, WORKSPACE_DIR, type PodSpecInput } from "./pod.js";
-import { buildSecretManifest, secretNameFor } from "./secret.js";
+import { buildPodManifest, WORKSPACE_DIR, PROMPT_FILE, type PodSpecInput } from "./pod.js";
+import { buildSecretManifest, podOwnerReference, secretNameFor } from "./secret.js";
 import { podNameFor } from "./naming.js";
 import { streamPodLog } from "./log-stream.js";
 import { buildPvcManifest, pvcNameFor } from "./pvc.js";
@@ -43,47 +44,44 @@ const FATAL_WAITING_REASONS = new Set([
   "CreateContainerError",
 ]);
 
-/** Skeleton config the adapter needs; grows in later plans (skill staging and
- *  stdin/attach wiring land in Plan 3).
- *
- *  `storageClassName` / `workspaceSize` / `runAsUser` are optional for now —
- *  the factory (`sandbox.ts`) already resolves and passes all five fields via
- *  `resolveKubernetesConfig()`. `runAsUser` is consumed as of Task 2 (defaults
- *  to 10001 when unset — a stopgap). As of Task 5, `storageClassName` /
- *  `workspaceSize` size the per-(repo,PR) PVC (defaulting to `truenas-iscsi` /
- *  `5Gi` when unset). Task 6 makes all three required; kept optional here to
- *  avoid a mid-plan type break. */
+/** Config the adapter needs. `storageClassName` / `workspaceSize` size and
+ *  class the per-(repo,PR) PVC (Task 5); `runAsUser` is the pod and
+ *  initContainer security-context UID. The factory (`sandbox.ts`) resolves
+ *  and passes all five fields via `resolveKubernetesConfig()`. */
 export interface K8sAdapterConfig {
   namespace: string;
   image: string;
-  storageClassName?: string;
-  workspaceSize?: string;
-  runAsUser?: number;
+  storageClassName: string;
+  workspaceSize: string;
+  runAsUser: number;
   /** Injectable fake `K8sApis` for tests; defaults to the real client. */
   apis?: K8sApis;
 }
 
 /**
  * The `kubernetes` {@link Sandbox} adapter — one pod per `runAgent`/
- * `runCommand` call. As of Task 5, `provision` ensures a stable per-(repo,PR)
- * RWO PVC when handed a pre-clone descriptor (design B — the harness can't
- * pre-clone host-side, so an initContainer clones inside the pod) and falls
- * back to an ephemeral in-pod `emptyDir` otherwise. `stageSkills` is still a
- * stub (Plan 3), and `runAgent` does not yet deliver the prompt to the
- * container (see the comment on `runAgent` below) — ownerReference cleanup
- * and the prompt Secret land in Task 6.
+ * `runCommand` call. `provision` ensures a stable per-(repo,PR) RWO PVC when
+ * handed a pre-clone descriptor (design B — the harness can't pre-clone
+ * host-side, so an initContainer clones inside the pod) and falls back to an
+ * ephemeral in-pod `emptyDir` otherwise. `runAgent` delivers the prompt via a
+ * per-run prompt Secret mounted into the pod and piped to the agent's stdin.
+ * Both the creds and prompt Secrets are created BEFORE the Pod (a Pod whose
+ * `envFrom`/volume mount names a missing Secret fails to start); once the Pod
+ * exists, each Secret's `ownerReferences` is patched to the Pod's uid so
+ * deleting the Pod cascade-GCs them — `dispose` also best-effort deletes them
+ * directly as a backstop. `stageSkills` is still a stub (Plan 3).
  */
 export class KubernetesSandbox implements Sandbox {
   readonly backend: SandboxBackend = "kubernetes";
   private readonly apis: K8sApis;
   private readonly ns: string;
   private readonly image: string;
-  // Stopgap default until Task 6 finalizes cluster-wide runAsUser wiring.
   private readonly runAsUser: number;
   private readonly storageClassName: string;
   private readonly workspaceSize: string;
   private activePod?: string;
   private activeCredsSecret?: string;
+  private activePromptSecret?: string;
   /** Pre-clone descriptor from the last `provision()` call, if any — `runPod`
    *  needs the repo coordinates to build the clone initContainer. */
   private pre?: PrePopulateSpec;
@@ -96,9 +94,9 @@ export class KubernetesSandbox implements Sandbox {
     this.apis = cfg.apis ?? makeK8sApis();
     this.ns = cfg.namespace;
     this.image = opts.imageName ?? cfg.image;
-    this.runAsUser = cfg.runAsUser ?? 10001;
-    this.storageClassName = cfg.storageClassName ?? "truenas-iscsi";
-    this.workspaceSize = cfg.workspaceSize ?? "5Gi";
+    this.runAsUser = cfg.runAsUser;
+    this.storageClassName = cfg.storageClassName;
+    this.workspaceSize = cfg.workspaceSize;
   }
 
   async provision(pre?: PrePopulateSpec): Promise<ProvisionResult> {
@@ -143,37 +141,41 @@ export class KubernetesSandbox implements Sandbox {
 
   async runAgent(
     taskId: string,
-    _prompt: string,
+    prompt: string,
     opts: RunAgentOpts,
     onEvent: (record: SandboxEvent) => void,
   ): Promise<RunResult | undefined> {
-    // Plan 1 decision A: prompt delivery is intentionally NOT wired here.
-    // Delivering `_prompt` needs a stdin attach into the container, which
-    // Plan 2 adds; for now this only exercises the create -> stream -> delete
-    // pod mechanism (verified by the unit test's fake log stream).
-    const cmd = ["agentic-pi", "run", "--model", opts.model, "--sandbox", "none", "--no-session"];
-    await this.runPod(
+    // The prompt reaches the container via a mounted Secret file (see
+    // `runPod`'s `promptText`), piped to stdin — never as a CLI arg (`ps`
+    // -visible) or inline env. `opts.model` arrives as a positional arg to
+    // `sh`, NOT interpolated into the script text — the same
+    // command-injection class `init-clone.ts` guards against for
+    // owner/repo/branch: `sh -c SCRIPT sh <model>` binds argv to `$1` at exec
+    // time, immune to quote-breaking regardless of characters.
+    const script = `exec agentic-pi run --model "$1" --sandbox none --no-session < ${PROMPT_FILE}`;
+    await this.runPod({
       taskId,
-      cmd,
-      { ...this.opts.env, ...opts.sandboxEnv },
-      opts.agentCwd,
-      parseLine(onEvent),
-    );
+      command: ["sh", "-c", script, "sh", opts.model],
+      env: { ...this.opts.env, ...opts.sandboxEnv },
+      cwd: opts.agentCwd,
+      onLine: parseLine(onEvent),
+      promptText: prompt,
+    });
     return undefined; // orchestrator reconstructs the result from the streamed events
   }
 
   async runCommand(taskId: string, command: string, opts: RunCommandOpts): Promise<RawCommandResult> {
     let stdout = "";
-    await this.runPod(
+    await this.runPod({
       taskId,
-      ["sh", "-c", command],
-      { ...this.opts.env, ...(opts.sandboxEnv ?? {}) },
-      opts.cwd,
-      (line) => {
+      command: ["sh", "-c", command],
+      env: { ...this.opts.env, ...(opts.sandboxEnv ?? {}) },
+      cwd: opts.cwd,
+      onLine: (line) => {
         stdout += line + "\n";
       },
-      opts.timeoutSeconds,
-    );
+      timeoutSeconds: opts.timeoutSeconds,
+    });
     const { exitCode, timedOut } = await this.awaitPodResult(this.activePod!);
     return { exitCode, stdout, stderr: "", timedOut };
   }
@@ -206,14 +208,18 @@ export class KubernetesSandbox implements Sandbox {
     return { exitCode: pod.status?.phase === "Succeeded" ? 0 : 1, timedOut: false };
   }
 
-  private async runPod(
-    taskId: string,
-    command: string[],
-    env: Record<string, string>,
-    cwd: string,
-    onLine: (line: string) => void,
-    timeoutSeconds?: number,
-  ): Promise<void> {
+  private async runPod(input: {
+    taskId: string;
+    command: string[];
+    env: Record<string, string>;
+    cwd: string;
+    onLine: (line: string) => void;
+    timeoutSeconds?: number;
+    /** Prompt text for a `runAgent` call — creates a prompt Secret mounted
+     *  into the pod. Omitted for `runCommand` (no prompt to deliver). */
+    promptText?: string;
+  }): Promise<void> {
+    const { taskId, command, env, cwd, onLine, timeoutSeconds, promptText } = input;
     const name = podNameFor(taskId, "run");
     this.activePod = name;
 
@@ -232,6 +238,24 @@ export class KubernetesSandbox implements Sandbox {
         labels: { "lastlight.io/pod": name },
       }),
     });
+
+    // The prompt travels the same way — a per-run Secret mounted read-only
+    // and piped to stdin by the command `runAgent` built. Same ordering rule:
+    // created before the pod, whose volume mount would otherwise fail to start.
+    let promptName: string | undefined;
+    if (promptText !== undefined) {
+      promptName = secretNameFor(name, "prompt");
+      this.activePromptSecret = promptName;
+      await this.apis.core.createNamespacedSecret({
+        namespace: this.ns,
+        body: buildSecretManifest({
+          name: promptName,
+          namespace: this.ns,
+          data: { prompt: promptText },
+          labels: { "lastlight.io/pod": name },
+        }),
+      });
+    }
 
     // Minimal clone init (locked decision #2) — only when this run has a PVC
     // workspace AND a pre-clone descriptor (an ephemeral emptyDir run has
@@ -260,15 +284,75 @@ export class KubernetesSandbox implements Sandbox {
       image: this.image,
       command,
       envFromSecret: credsName,
+      promptSecret: promptName,
       cwd,
       activeDeadlineSeconds: timeoutSeconds ?? this.opts.timeoutSeconds ?? 1800,
       runAsUser: this.runAsUser,
       workspace: this.workspace,
       initContainers,
     });
-    await this.apis.core.createNamespacedPod({ namespace: this.ns, body: manifest });
+    const created = await this.createPodOrCleanupSecrets(manifest, credsName, promptName);
+    await this.patchSecretOwnerRefs(name, created, credsName, promptName);
     await this.waitForContainerStart(name);
     await streamPodLog(this.apis.log, this.ns, name, "agent", onLine);
+  }
+
+  /** Create the Pod; on failure, best-effort delete the Secret(s) already
+   *  created for it (they exist before the Pod per the ordering rule above),
+   *  so a failed create doesn't orphan them — then rethrow. */
+  private async createPodOrCleanupSecrets(
+    manifest: V1Pod,
+    credsName: string,
+    promptName: string | undefined,
+  ): Promise<V1Pod> {
+    try {
+      return await this.apis.core.createNamespacedPod({ namespace: this.ns, body: manifest });
+    } catch (err) {
+      await this.deleteSecretBestEffort(credsName);
+      if (promptName) await this.deleteSecretBestEffort(promptName);
+      throw err;
+    }
+  }
+
+  /**
+   * Cascade-GC ref: patch each Secret's `ownerReferences` to the created
+   * Pod's uid, so deleting the Pod GCs them too (`dispose` also best-effort
+   * deletes them directly as a backstop). client-node 1.4.0's
+   * `patchNamespacedSecret` always negotiates `Content-Type:
+   * application/json-patch+json` — `ObjectSerializer.getPreferredMediaType`
+   * walks its candidate list (json-patch, merge-patch, strategic-merge-patch,
+   * apply-patch) and returns the first one matching "is JSON-like", which is
+   * json-patch every time — so the body must be an RFC 6902 JSON Patch
+   * document, not a partial merge object. `add` (not `replace`) because
+   * `ownerReferences` doesn't exist on a freshly created Secret.
+   */
+  private async patchSecretOwnerRefs(
+    podName: string,
+    pod: V1Pod,
+    credsName: string,
+    promptName: string | undefined,
+  ): Promise<void> {
+    const uid = pod.metadata?.uid;
+    if (!uid) throw new Error(`k8s sandbox pod ${podName} was created without a uid`);
+    const patch = [
+      { op: "add", path: "/metadata/ownerReferences", value: [podOwnerReference(podName, uid)] },
+    ];
+    const namespace = this.ns;
+    await this.apis.core.patchNamespacedSecret({ name: credsName, namespace, body: patch });
+    if (promptName) {
+      await this.apis.core.patchNamespacedSecret({ name: promptName, namespace, body: patch });
+    }
+  }
+
+  /** Best-effort Secret delete — used both by the pod-create failure path and
+   *  `dispose`; swallows the error since the Secret may already be gone
+   *  (cascade-GC'd with the pod, or the reclaim sweep). */
+  private async deleteSecretBestEffort(name: string): Promise<void> {
+    try {
+      await this.apis.core.deleteNamespacedSecret({ name, namespace: this.ns });
+    } catch {
+      /* already gone */
+    }
   }
 
   /**
@@ -317,15 +401,12 @@ export class KubernetesSandbox implements Sandbox {
       this.activePod = undefined;
     }
     if (this.activeCredsSecret) {
-      try {
-        await this.apis.core.deleteNamespacedSecret({
-          name: this.activeCredsSecret,
-          namespace: this.ns,
-        });
-      } catch {
-        /* already gone (cascade-GC'd with the pod, or the reclaim sweep) */
-      }
+      await this.deleteSecretBestEffort(this.activeCredsSecret);
       this.activeCredsSecret = undefined;
+    }
+    if (this.activePromptSecret) {
+      await this.deleteSecretBestEffort(this.activePromptSecret);
+      this.activePromptSecret = undefined;
     }
   }
 }
