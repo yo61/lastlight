@@ -1,6 +1,6 @@
 # Handover — Kubernetes sandbox backend
 
-**Last updated:** 2026-07-25 · **Status:** Plan 4 (skills) complete + final-reviewed (opus, clean — ready to merge). Plan 3 (egress) cluster-validated under real enforcement (via admin creds). Plans 4 & 3 are local-only until pushed. Next: Plan 5 (lifecycle).
+**Last updated:** 2026-07-25 · **Status:** Plan 5 (lifecycle/reclaim) complete + final-reviewed (opus, clean). Plans 3 (egress) cluster-validated under real enforcement; 4 (skills) final-reviewed. Plan 5 is local-only until pushed. Next: Plan 6 (concurrency/backpressure).
 
 ## TL;DR
 
@@ -10,10 +10,10 @@ contribution. It runs each workflow phase as its own Pod (create → wait-for-st
 → stream JSONL → reap) behind the existing `Sandbox` port, instead of the
 in-process QEMU (`gondolin`) backend.
 
-- **Plans 1 + 2 DONE + cluster-validated. Plan 3 (egress) DONE + cluster-validated under real enforcement. Plan 4 (skills) DONE + final-reviewed (opus, clean).**
-- Branch: **`feat/k8s-sandbox-backend`** — Plan-3 range `02a912a..d573b42` (pushed to the fork); **Plan-4 range `d573b42..7233d2c`** (12 commits incl. the plan doc), **local-only** — push with `git push origin feat/k8s-sandbox-backend`.
-- **Roadmap was SPLIT** (Robin's call, Clifton approved the direction): the old "Plan 3 = egress + skills" became two plans, so the roadmap is now **6 plans**: 1 skeleton, 2 creds, **3 egress (DONE)**, **4 skills (DONE)**, 5 lifecycle, 6 Flux. Every "Plan 4 (lifecycle)" / "Plan 5 (Flux)" reference below that predates this split now means Plan 5 / Plan 6.
-- Next: **Plan 5 — lifecycle + concurrency** (`reclaimSandbox(selector)` authority: cron / PR-closed / cancel triggers; quota-backpressure admission; `fsGroupChangePolicy: OnRootMismatch` for reused PVCs; the RWO Multi-Attach edge). Design §6 + §8. Then Plan 6 = Flux manifests (Namespace/SA/Role/RoleBinding/ResourceQuota + the harness Deployment SA) — which turns on egress + `toEndpoints` enforcement AND makes the harness reachable in-cluster so the Plan-4 skill fetch validates end-to-end.
+- **Plans 1 + 2 + 3 (egress) + 4 (skills) DONE. Plan 5 (lifecycle/reclaim) DONE + final-reviewed (opus, clean).**
+- Branch: **`feat/k8s-sandbox-backend`** — Plan-4 pushed to the fork; **Plan-5 range `9509313..464bf68`** (8 commits incl. the plan doc), **local-only** — push with `git push origin feat/k8s-sandbox-backend`.
+- **Roadmap SPLIT TWICE** (Robin's calls): first "Plan 3 = egress + skills" → egress(3)+skills(4); then "Plan 5 = lifecycle + concurrency" → lifecycle(5)+concurrency(6). So the roadmap is now **7 plans**: 1 skeleton, 2 creds, **3 egress ✓**, **4 skills ✓**, **5 lifecycle ✓**, 6 concurrency, 7 Flux. Any older "Plan 6 (Flux)" reference below now means **Plan 7**.
+- Next: **Plan 6 — concurrency / quota-backpressure** (§8): re-source the admission slot-signal from `countRunning < maxWorkflows` to "did the pod create succeed"; treat a `403 exceeded quota` as backpressure (run stays queued, retried on completion); keep an absurdly-high sanity fuse. Touches SHARED admission machinery (`src/workflows/admission.ts` `createAdmissionController`/`admitNext`, `src/workflows/simple.ts`'s `countRunning >= maxWorkflows` gate) with a k8s-specific branch. Its enforcement validation is gated on **Plan 7**'s Flux `ResourceQuota` (build+unit-tested until then, like Plan 3's egress). Then **Plan 7 = Flux manifests** (Namespace/SA/Role/RoleBinding/ResourceQuota + harness Deployment SA) — turns on egress + `toEndpoints` + reclaim-RBAC enforcement AND makes the harness reachable in-cluster so the Plan-4 skill fetch validates end-to-end.
 - Plan docs: `plan-2-…`, `plan-3-egress.md`, `plan-4-skills.md`. SDD ledgers are per-plan: `.superpowers/sdd/plan-4-skills/progress.md` (Plan 4 — per-task reviews, 6 fix-loop items, the final-review fix wave, deferred minors). Plan 3's is `.superpowers/sdd/plan-3-egress/progress.md`; Plan 2's is the old flat `.superpowers/sdd/progress.md`.
 
 ## Plan 2 — what landed + open follow-ups (tracked, deliberately deferred)
@@ -47,17 +47,28 @@ Skill delivery over an **authenticated HTTP channel** (design §7). Robin chose 
 - **New config** (`sandbox.kubernetes.*`, Plan-6-finalized defaults): `harnessEndpoint` (`http://lastlight.lastlight.svc.cluster.local:8644`), `harnessNamespace` (`lastlight`), `harnessPodLabels` (`{app.kubernetes.io/name: lastlight}`) — the URL the init fetches + the `toEndpoints` selector.
 - **Deferred minors** (final review, all safe-to-defer — see `.superpowers/sdd/plan-4-skills/progress.md`): the `/internal/` route is bearer-only (Plan 6 supplies the cluster-internal network story); the adapter re-trusts `opts.skillDirs` (defense-in-depth only, matches the docker pattern); `harnessPodLabels` normalization throws on a non-string object value (prior-art consistent). The collision-guard + TTL-docstring items were folded into the fix wave.
 
+## Plan 5 — what landed + open follow-ups (lifecycle/reclaim; final review clean)
+
+Scope was **§6 lifecycle only** (concurrency split out to Plan 6). A single idempotent **`reclaimSandbox(selector)`** authority (`k8s/reclaim.ts`) — the only code besides per-run `dispose` that deletes sandbox objects — lists Pods+PVCs by the managed-by label, **never deletes a PVC a live Pod mounts** (pure `livePvcClaimNames`/`pvcsToReclaim`, tested both directions), and deletes what a selector matches: `{kind:"run",runId}` (admin-cancel) or `{kind:"sweep",staleByHours,maxIdlePVCs}` (the sweep cron — age then LRU, honest union, `staleByHours:0` reclaims all idle-by-age). Idempotent (404=ok), best-effort (per-object warn+continue), **403 on list → warn once + no-op** (reclaim RBAC lands in Plan 7). Pods/PVCs gained a `lastlight.io/run-id` label (sanitized identically at label + cancel-selector). Plus **`fsGroupChangePolicy: OnRootMismatch`** (reused-PVC chown perf) and **`dispose` waits for Pod deletion** (bounded 30×1s → closes the RWO Multi-Attach edge). Triggers: the sweep cron (`sweepK8sSandboxes`, index.ts branch on `config.sandbox==="kubernetes"`) + admin-cancel (routes.ts branch). Opus final review: **clean, no Critical** — the never-delete-live-PVC invariant + own-pod-exclusion (a `run` cancel deletes its own PVC but not a *different* live run's) are structural + tested.
+
+- **Deferred with reasoning:** the **PR-closed webhook trigger** (`{repo,pr}` selector) — net-new connector wiring + repo/pr labels; the age/LRU sweep already bounds disk, so PR-closed is a reclaim-*sooner* optimization, not correctness. Fast-follow.
+- **Reused-PVC cancel keeps the warm cache BY DESIGN:** a per-(repo,PR) reuse workflow's PVC keeps its first run's `run-id` label, so cancelling a *later* run deletes its Pod (in-flight kill — always) but leaves the reused PVC (issue #107 warm cache; the sweep reclaims it when idle). The cancel-route comment was corrected to say this (final fix wave). Ephemeral per-run PVCs ARE deleted on cancel.
+- **Parked minors** (safe-to-defer — see `.superpowers/sdd/plan-5-lifecycle/progress.md`): no shared `MANAGED_BY` label constant (duplicated across pod/pvc/secret/reclaim); a reap-on-success trigger for ephemeral PVCs (currently only the Pod is disposed on success; the PVC waits for the sweep — bounded but asymmetric with the host reap-on-completion) — worth a Plan 6/7 look.
+- **Reclaim IS cluster-validatable now** (create Pods/PVCs as admin, reclaim by run + verify live-skip) — the opt-in `RUN_K8S_IT` Plan 5 block (`kubernetes.integration.test.ts`) does exactly that. **Robin: heads-up — Case B's cleanup sweep vacuums ALL idle PVCs in `lastlight-sandboxes`, so a repeated IT run also clears leftover Plan 1–4 PVCs in that namespace.**
+
 ## Resume the AI session (paste to a fresh Claude)
 
 > Resume the k8s sandbox backend work. Read, in this repo:
-> `docs/plans/kubernetes-sandbox-backend/HANDOVER.md`, `design.md` (esp. §6 lifecycle
-> + §8 concurrency), and `.superpowers/sdd/plan-4-skills/progress.md`. Plans 1–4 are
-> complete (4 = skills, final-reviewed clean); the roadmap was split so lifecycle is
-> now **Plan 5**. Write **Plan 5 (lifecycle + concurrency)** with the
-> `superpowers:writing-plans` skill (`reclaimSandbox(selector)` — cron/PR-closed/cancel
-> triggers; quota-backpressure admission; `fsGroupChangePolicy: OnRootMismatch` for
-> reused PVCs; the RWO Multi-Attach edge), then execute it with
-> `superpowers:subagent-driven-development`, same as Plans 1–4. We're on branch
+> `docs/plans/kubernetes-sandbox-backend/HANDOVER.md`, `design.md` (esp. §8 concurrency),
+> and `.superpowers/sdd/plan-5-lifecycle/progress.md`. Plans 1–5 are complete (5 =
+> lifecycle/reclaim, final-reviewed clean); the roadmap was split so concurrency is now
+> **Plan 6**. Write **Plan 6 (concurrency / quota-backpressure)** with the
+> `superpowers:writing-plans` skill (re-source the admission slot-signal from
+> `countRunning < maxWorkflows` to "did the pod create succeed"; treat `403 exceeded
+> quota` as backpressure → requeue + retry on completion; keep an absurdly-high sanity
+> fuse; it touches the SHARED `src/workflows/admission.ts` + `simple.ts` admission
+> machinery with a k8s branch), then execute it with
+> `superpowers:subagent-driven-development`, same as Plans 1–5. We're on branch
 > `feat/k8s-sandbox-backend`.
 
 ## Key files
