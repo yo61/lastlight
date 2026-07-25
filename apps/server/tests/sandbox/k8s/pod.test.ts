@@ -33,6 +33,7 @@ describe("buildPodManifest securityContext", () => {
   it("sets a restricted-compliant pod securityContext", () => {
     expect(pod.spec?.securityContext?.runAsNonRoot).toBe(true);
     expect(pod.spec?.securityContext?.runAsUser).toBe(10001);
+    expect(pod.spec?.securityContext?.fsGroup).toBe(10001);
     expect(pod.spec?.securityContext?.seccompProfile?.type).toBe("RuntimeDefault");
   });
   it("sets a restricted-compliant container securityContext", () => {

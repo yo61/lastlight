@@ -51,6 +51,12 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
       securityContext: {
         runAsNonRoot: true,
         runAsUser: i.runAsUser,
+        // Chown mounted volumes to this group and add the process to it, so a
+        // non-root process can write the RWO PVC — which mounts root-owned, so
+        // without this the clone initContainer fails to create the checkout dir
+        // ("could not create work tree dir: Permission denied"). Reuses the
+        // runAsUser value as the group id (a standard non-root idiom).
+        fsGroup: i.runAsUser,
         seccompProfile: { type: "RuntimeDefault" },
       },
       volumes: [
