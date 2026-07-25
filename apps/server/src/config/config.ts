@@ -178,6 +178,13 @@ export interface KubernetesConfig {
   storageClassName: string;
   workspaceSize: string;
   runAsUser: number;
+  /** Base URL the sandbox's skills initContainer fetches the bundle from
+   *  (the harness Service, cross-namespace). */
+  harnessEndpoint: string;
+  /** The harness Pod's namespace — the `toEndpoints` egress selector. */
+  harnessNamespace: string;
+  /** The harness Pod's Cilium selector labels — the `toEndpoints` egress rule. */
+  harnessPodLabels: Record<string, string>;
 }
 
 export interface SandboxCleanupConfig {
@@ -590,6 +597,15 @@ function normalizeKubernetesFileConfig(raw: Record<string, unknown>): Partial<Ku
   }
   if (typeof raw.workspaceSize === "string" && raw.workspaceSize.trim()) out.workspaceSize = raw.workspaceSize.trim();
   if (typeof raw.runAsUser === "number" && Number.isFinite(raw.runAsUser)) out.runAsUser = raw.runAsUser;
+  if (typeof raw.harnessEndpoint === "string" && raw.harnessEndpoint.trim()) {
+    out.harnessEndpoint = raw.harnessEndpoint.trim();
+  }
+  if (typeof raw.harnessNamespace === "string" && raw.harnessNamespace.trim()) {
+    out.harnessNamespace = raw.harnessNamespace.trim();
+  }
+  if (isPlainObject(raw.harnessPodLabels)) {
+    out.harnessPodLabels = stringRecord(raw.harnessPodLabels, "kubernetes.harnessPodLabels");
+  }
   return out;
 }
 
@@ -856,7 +872,22 @@ const K8S_DEFAULTS: KubernetesConfig = {
   storageClassName: "truenas-iscsi",
   workspaceSize: "5Gi",
   runAsUser: 10001,
+  harnessEndpoint: "http://lastlight.lastlight.svc.cluster.local:8644",
+  harnessNamespace: "lastlight",
+  harnessPodLabels: { "app.kubernetes.io/name": "lastlight" },
 };
+
+/** Parse a `k=v,k=v` env string into a label map; empty/malformed → `undefined`
+ *  so callers fall through to the runtime block, then {@link K8S_DEFAULTS}. */
+function parseLabels(raw: string | undefined): Record<string, string> | undefined {
+  if (!raw) return undefined;
+  const out: Record<string, string> = {};
+  for (const pair of raw.split(",")) {
+    const [k, v] = pair.split("=").map((s) => s.trim());
+    if (k && v) out[k] = v;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
 
 /**
  * Resolve the `kubernetes` sandbox backend's config: env override → the
@@ -876,6 +907,14 @@ export function resolveKubernetesConfig(): KubernetesConfig {
     workspaceSize:
       process.env.LASTLIGHT_K8S_WORKSPACE_SIZE ?? k.workspaceSize ?? K8S_DEFAULTS.workspaceSize,
     runAsUser: Number.isFinite(runAsUserEnv) ? runAsUserEnv : (k.runAsUser ?? K8S_DEFAULTS.runAsUser),
+    harnessEndpoint:
+      process.env.LASTLIGHT_K8S_HARNESS_ENDPOINT ?? k.harnessEndpoint ?? K8S_DEFAULTS.harnessEndpoint,
+    harnessNamespace:
+      process.env.LASTLIGHT_K8S_HARNESS_NAMESPACE ?? k.harnessNamespace ?? K8S_DEFAULTS.harnessNamespace,
+    harnessPodLabels:
+      parseLabels(process.env.LASTLIGHT_K8S_HARNESS_POD_LABELS) ??
+      k.harnessPodLabels ??
+      K8S_DEFAULTS.harnessPodLabels,
   };
 }
 
