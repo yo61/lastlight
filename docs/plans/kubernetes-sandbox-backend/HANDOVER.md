@@ -1,6 +1,6 @@
 # Handover — Kubernetes sandbox backend
 
-**Last updated:** 2026-07-25 · **Status:** Plan 3 (egress) complete + final-reviewed (opus, clean). Plan 2 remains VALIDATED end-to-end on the real cluster. Plan 3 enforcement validation is pending Plan 6 RBAC (the IT skips gracefully until then).
+**Last updated:** 2026-07-25 · **Status:** Plan 4 (skills) complete + final-reviewed (opus, clean — ready to merge). Plan 3 (egress) cluster-validated under real enforcement (via admin creds). Plans 4 & 3 are local-only until pushed. Next: Plan 5 (lifecycle).
 
 ## TL;DR
 
@@ -10,11 +10,11 @@ contribution. It runs each workflow phase as its own Pod (create → wait-for-st
 → stream JSONL → reap) behind the existing `Sandbox` port, instead of the
 in-process QEMU (`gondolin`) backend.
 
-- **Plan 1 + Plan 2 DONE + cluster-validated. Plan 3 (egress) DONE + final-reviewed (opus, clean).**
-- Branch: **`feat/k8s-sandbox-backend`** — Plan-2 range `0dc9b9d..03d871d`; **Plan-3 range `02a912a..49e72fd`** (10 commits, incl. the plan doc). Plan 2 was pushed to the fork; **Plan 3 is local-only** — push with `git push origin feat/k8s-sandbox-backend`.
-- **Roadmap was SPLIT** (Robin's call, Clifton approved the direction): the old "Plan 3 = egress + skills" became two plans, so the roadmap is now **6 plans**: 1 skeleton, 2 creds, **3 egress (DONE)**, **4 skills**, 5 lifecycle, 6 Flux. Every "Plan 4 (lifecycle)" / "Plan 5 (Flux)" reference below that predates this split now means Plan 5 / Plan 6.
-- Next: **Plan 4 — skills** (HTTP skill-bundle endpoint on the harness + initContainer fetch into a shared emptyDir + the Cilium `toEndpoints` sandbox→harness rule; carries `skillDirs`, and `webSearch`). Design §7 + §4's harness-channel bullet.
-- Plan docs: `plan-2-creds-workspace.md`, `plan-3-egress.md`. SDD ledgers are now **per-plan**: `.superpowers/sdd/plan-3-egress/progress.md` (Plan 3 — per-task reviews, 2 fix-loop items, the final-review fix wave, 5 parked minors). Plan 2's is the old flat `.superpowers/sdd/progress.md`.
+- **Plans 1 + 2 DONE + cluster-validated. Plan 3 (egress) DONE + cluster-validated under real enforcement. Plan 4 (skills) DONE + final-reviewed (opus, clean).**
+- Branch: **`feat/k8s-sandbox-backend`** — Plan-3 range `02a912a..d573b42` (pushed to the fork); **Plan-4 range `d573b42..7233d2c`** (12 commits incl. the plan doc), **local-only** — push with `git push origin feat/k8s-sandbox-backend`.
+- **Roadmap was SPLIT** (Robin's call, Clifton approved the direction): the old "Plan 3 = egress + skills" became two plans, so the roadmap is now **6 plans**: 1 skeleton, 2 creds, **3 egress (DONE)**, **4 skills (DONE)**, 5 lifecycle, 6 Flux. Every "Plan 4 (lifecycle)" / "Plan 5 (Flux)" reference below that predates this split now means Plan 5 / Plan 6.
+- Next: **Plan 5 — lifecycle + concurrency** (`reclaimSandbox(selector)` authority: cron / PR-closed / cancel triggers; quota-backpressure admission; `fsGroupChangePolicy: OnRootMismatch` for reused PVCs; the RWO Multi-Attach edge). Design §6 + §8. Then Plan 6 = Flux manifests (Namespace/SA/Role/RoleBinding/ResourceQuota + the harness Deployment SA) — which turns on egress + `toEndpoints` enforcement AND makes the harness reachable in-cluster so the Plan-4 skill fetch validates end-to-end.
+- Plan docs: `plan-2-…`, `plan-3-egress.md`, `plan-4-skills.md`. SDD ledgers are per-plan: `.superpowers/sdd/plan-4-skills/progress.md` (Plan 4 — per-task reviews, 6 fix-loop items, the final-review fix wave, deferred minors). Plan 3's is `.superpowers/sdd/plan-3-egress/progress.md`; Plan 2's is the old flat `.superpowers/sdd/progress.md`.
 
 ## Plan 2 — what landed + open follow-ups (tracked, deliberately deferred)
 
@@ -39,16 +39,25 @@ Scope was **egress only** (skills split out to Plan 4). A strict/open **`CiliumN
 - **Enforcement IT is opt-in + skips gracefully.** A new `RUN_K8S_IT` case curls an allowlisted host (expect 200) and a non-allowlisted host (expect blocked); if the strict CNP wasn't applied (403, no RBAC yet) it `console.warn`s and asserts only the allowlisted side. **Robin: full block-assertion validates only after Plan 6 RBAC lands.**
 - **5 parked minors** (final review, all safe-to-defer — see `.superpowers/sdd/plan-3-egress/progress.md`): `strictPolicyPresent` blanket `catch` (log the error); DNS `matchPattern:"*"` leaves a DNS-tunnel channel (same exposure as docker; tracked); the open except-list is cluster-scoped (add a comment naming the pod/service-CIDR dependency if reused elsewhere); the `resourceVersion` double-cast is stylistic; **`strictHosts()` duplicates `egressPolicyFor`'s merge — a Plan 6 egress-consolidation candidate (#134)**.
 
+## Plan 4 — what landed + open follow-ups (skills; final review clean, ready to merge)
+
+Skill delivery over an **authenticated HTTP channel** (design §7). Robin chose HTTP-fetch over a simpler ConfigMap-mount (bundles are tiny — ≤68K text — but the design's server-mode-POST-back reuse justifies the channel). The harness tars each phase's resolved skill dirs into a gzipped `Buffer` (via system `tar` — **no new npm dep**) and registers the bytes under a per-run `randomUUID` token; a new `GET /internal/skill-bundle` bearer-auth route (`k8s/skill-bundle-route.ts`, mounted on the shared Hono app) streams them. A **skills initContainer** (`k8s/init-skills.ts`) `curl`s it with the token (delivered in the creds Secret as `LASTLIGHT_SKILL_TOKEN`, endpoint passed as a positional arg — argv-safe) and unpacks into a shared `skills` emptyDir the agent mounts at `/lastlight-skills`; `runAgent` appends `--skill /lastlight-skills/<name>` per skill (names sanitized `[A-Za-z0-9_-]` → injection-safe). The sandbox→harness hop is a **`toEndpoints`** rule added to *both* egress policies (extends the Plan 3 renderer). Closes the tracked `skillDirs` RunAgentOpts gap. Opus final review: **clean, ready to merge** — the 4 named security risks (auth boundary token-gated 401; `--skill` injection closed via the sanitize chain; token reaches the init via `buildPodManifest`'s `envFrom` overwrite; `runCommand` carries no skills state) all verified + test-pinned.
+
+- **E2E pod→harness fetch is deferred to Plan 6.** The initContainer's fetch needs the harness reachable *from* a sandbox Pod, which only happens once the harness deploys in-cluster (Plan 6). So Plan 4 ships with an **in-process** endpoint round-trip IT (`skill-bundle.integration.test.ts`, ungated — build→register→serve→unpack→assert) that validates the serve+unpack contract NOW; the full pod fetch validates post-Plan-6. Under strict egress the fetch ALSO needs the `toEndpoints` rule live (Plan 6 RBAC) — until then default-allow carries it.
+- **New config** (`sandbox.kubernetes.*`, Plan-6-finalized defaults): `harnessEndpoint` (`http://lastlight.lastlight.svc.cluster.local:8644`), `harnessNamespace` (`lastlight`), `harnessPodLabels` (`{app.kubernetes.io/name: lastlight}`) — the URL the init fetches + the `toEndpoints` selector.
+- **Deferred minors** (final review, all safe-to-defer — see `.superpowers/sdd/plan-4-skills/progress.md`): the `/internal/` route is bearer-only (Plan 6 supplies the cluster-internal network story); the adapter re-trusts `opts.skillDirs` (defense-in-depth only, matches the docker pattern); `harnessPodLabels` normalization throws on a non-string object value (prior-art consistent). The collision-guard + TTL-docstring items were folded into the fix wave.
+
 ## Resume the AI session (paste to a fresh Claude)
 
 > Resume the k8s sandbox backend work. Read, in this repo:
-> `docs/plans/kubernetes-sandbox-backend/HANDOVER.md`, `design.md` (esp. §7 skills
-> + §4 harness-channel), and `.superpowers/sdd/plan-3-egress/progress.md`. Plans 1–3
-> are complete (3 = egress, final-reviewed clean); the roadmap was split so **skills
-> is now Plan 4**. Write **Plan 4 (skills)** with the `superpowers:writing-plans`
-> skill (HTTP skill-bundle endpoint + initContainer fetch + the Cilium `toEndpoints`
-> sandbox→harness rule, extending `k8s/egress-policy.ts`), then execute it with
-> `superpowers:subagent-driven-development`, same as Plans 1–3. We're on branch
+> `docs/plans/kubernetes-sandbox-backend/HANDOVER.md`, `design.md` (esp. §6 lifecycle
+> + §8 concurrency), and `.superpowers/sdd/plan-4-skills/progress.md`. Plans 1–4 are
+> complete (4 = skills, final-reviewed clean); the roadmap was split so lifecycle is
+> now **Plan 5**. Write **Plan 5 (lifecycle + concurrency)** with the
+> `superpowers:writing-plans` skill (`reclaimSandbox(selector)` — cron/PR-closed/cancel
+> triggers; quota-backpressure admission; `fsGroupChangePolicy: OnRootMismatch` for
+> reused PVCs; the RWO Multi-Attach edge), then execute it with
+> `superpowers:subagent-driven-development`, same as Plans 1–4. We're on branch
 > `feat/k8s-sandbox-backend`.
 
 ## Key files
