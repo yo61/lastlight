@@ -26,6 +26,12 @@ interface FakeOpts {
    *  resolves, so the egress-ensure call is a silent no-op in tests that
    *  don't care about it. */
   createNamespacedCustomObject?: ReturnType<typeof vi.fn>;
+  /** Number of non-404 `readNamespacedPodStatus` responses to return AFTER
+   *  `deleteNamespacedPod` succeeds, before it 404s (pod actually gone) —
+   *  exercises `dispose`'s post-delete `waitForPodGone` poll. Default 0: the
+   *  pod reads back as gone on the very first poll after delete, so tests
+   *  that don't care about this wait stay fast. */
+  goneAfterDeletePolls?: number;
 }
 
 function fakeApis(opts: FakeOpts = {}) {
@@ -39,6 +45,9 @@ function fakeApis(opts: FakeOpts = {}) {
   const pvcsCreated: any[] = [];
   const customCreated =
     opts.createNamespacedCustomObject ?? vi.fn(async () => ({}));
+  let podDeleted = false;
+  let postDeletePolls = 0;
+  const goneAfterDeletePolls = opts.goneAfterDeletePolls ?? 0;
   return {
     apis: {
       core: {
@@ -49,10 +58,23 @@ function fakeApis(opts: FakeOpts = {}) {
           // server-assigned uid — the ownerRef patch reads it off this return.
           return { ...body, metadata: { ...body.metadata, uid: "pod-uid-1" } };
         }),
-        readNamespacedPodStatus: vi.fn(async () => ({ status })),
+        readNamespacedPodStatus: vi.fn(async () => {
+          // Mirrors real k8s: once the pod is actually deleted, subsequent
+          // status reads 404. `goneAfterDeletePolls` delays that 404 by N
+          // polls, for tests exercising `waitForPodGone`'s loop.
+          if (podDeleted) {
+            if (postDeletePolls < goneAfterDeletePolls) {
+              postDeletePolls += 1;
+              return { status };
+            }
+            throw new ApiException(404, "Not Found", {}, {});
+          }
+          return { status };
+        }),
         deleteNamespacedPod: vi.fn(async ({ name }: any) => {
           if (opts.deleteThrows) throw new Error("boom");
           deleted.push(name);
+          podDeleted = true;
           return {};
         }),
         createNamespacedSecret: vi.fn(async ({ body }: any) => {
@@ -268,6 +290,80 @@ describe("KubernetesSandbox", () => {
     await sbx.provision();
     await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
     await expect(sbx.dispose()).resolves.toBeUndefined();
+  });
+
+  it("dispose polls until the pod is gone (404) before returning", async () => {
+    // RWO Multi-Attach fix: after a successful delete, dispose must wait for
+    // the API to 404 the pod (proving the RWO volume is released) before it
+    // returns — otherwise a sequential next-phase pod on the same PVC can
+    // race the still-attaching volume. One extra non-404 poll after delete
+    // (goneAfterDeletePolls: 1) proves dispose actually LOOPS, not just
+    // checks once.
+    const { apis, deleted } = fakeApis({
+      status: { phase: "Running", containerStatuses: [{ state: { running: {} } }] },
+      goneAfterDeletePolls: 1,
+    });
+    const sbx = new KubernetesSandbox(factoryOpts, cfg(apis));
+    await sbx.provision();
+    // runAgent (not runCommand) — runCommand's own awaitPodResult poll would
+    // otherwise mix into the same readNamespacedPodStatus call count this
+    // test isolates to dispose's post-delete wait.
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace" } as any,
+      () => {},
+    );
+    const before = (apis.core.readNamespacedPodStatus as any).mock.calls.length;
+    await sbx.dispose();
+    const after = (apis.core.readNamespacedPodStatus as any).mock.calls.length;
+
+    expect(deleted).toHaveLength(1);
+    expect(after - before).toBeGreaterThanOrEqual(2); // still-present, then 404
+  });
+
+  it("dispose does not wait when the delete itself throws (pod already gone)", async () => {
+    const { apis } = fakeApis({ deleteThrows: true });
+    const sbx = new KubernetesSandbox(factoryOpts, cfg(apis));
+    await sbx.provision();
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace" } as any,
+      () => {},
+    );
+    const before = (apis.core.readNamespacedPodStatus as any).mock.calls.length;
+    await sbx.dispose();
+    const after = (apis.core.readNamespacedPodStatus as any).mock.calls.length;
+    expect(after).toBe(before); // no wait attempted — delete failed, nothing to poll for
+  });
+
+  it("dispose warns and returns when the pod-gone poll budget is exhausted", async () => {
+    const { apis } = fakeApis({
+      status: { phase: "Running", containerStatuses: [{ state: { running: {} } }] },
+      goneAfterDeletePolls: Number.POSITIVE_INFINITY,
+    });
+    const sbx = new KubernetesSandbox(factoryOpts, cfg(apis));
+    await sbx.provision();
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace" } as any,
+      () => {},
+    );
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      const disposePromise = sbx.dispose();
+      await vi.runAllTimersAsync();
+      await expect(disposePromise).resolves.toBeUndefined();
+      // Assert before mockRestore() — restore clears recorded mock.calls.
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("still present"));
+    } finally {
+      vi.useRealTimers();
+      warnSpy.mockRestore();
+    }
   });
 });
 

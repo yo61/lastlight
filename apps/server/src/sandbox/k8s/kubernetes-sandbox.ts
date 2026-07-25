@@ -45,6 +45,15 @@ const POD_STATUS_POLL_INTERVAL_MS = 500;
 const POD_START_POLL_ATTEMPTS = 60;
 const POD_START_POLL_INTERVAL_MS = 1000;
 
+/** Bound on the post-delete "pod actually gone" poll (RWO Multi-Attach fix):
+ *  a Pod deleted via the API isn't detached from its RWO PVC until it's
+ *  truly gone, so a sequential next-phase pod on the same PVC (possibly a
+ *  different node) can hit Multi-Attach if `dispose` returns too early.
+ *  Budget ~30 × 1s ≈ 30s; on exhaustion `waitForPodGone` warns and returns
+ *  anyway — never hang the run (the reclaim sweep, Plan 4, is the backstop). */
+const POD_DELETE_POLL_ATTEMPTS = 30;
+const POD_DELETE_POLL_INTERVAL_MS = 1000;
+
 /** Container `waiting.reason`s that will never resolve on their own — fail fast
  *  with the reason instead of waiting out the whole start budget. */
 const FATAL_WAITING_REASONS = new Set([
@@ -573,14 +582,44 @@ export class KubernetesSandbox implements Sandbox {
     }
   }
 
+  /**
+   * Poll after a successful pod delete until the API 404s it, so the RWO PVC
+   * (truenas-iscsi allows only one attached node) is actually released
+   * before `dispose` returns — a sequential next-phase pod reusing the same
+   * PVC on a different node would otherwise race the still-attaching volume
+   * and hit Multi-Attach. A 404 on the very first poll (pod already gone)
+   * succeeds immediately. Best-effort like the delete above: any non-404
+   * read error is treated as "not yet confirmed gone" and just retried
+   * within the budget, never failing the caller's `dispose()`.
+   */
+  private async waitForPodGone(name: string): Promise<void> {
+    for (let attempt = 0; attempt < POD_DELETE_POLL_ATTEMPTS; attempt++) {
+      try {
+        await this.apis.core.readNamespacedPodStatus({ name, namespace: this.ns });
+      } catch (err) {
+        if (err instanceof ApiException && err.code === 404) return; // gone
+      }
+      await new Promise((resolve) => setTimeout(resolve, POD_DELETE_POLL_INTERVAL_MS));
+    }
+    const budgetSeconds = (POD_DELETE_POLL_ATTEMPTS * POD_DELETE_POLL_INTERVAL_MS) / 1000;
+    console.warn(
+      `[k8s] pod ${name} still present ${budgetSeconds}s after delete — proceeding anyway ` +
+        `(a sequential pod on the same PVC may race the volume release).`,
+    );
+  }
+
   async dispose(): Promise<void> {
     if (this.activePod) {
+      const name = this.activePod;
+      let deleteSucceeded = false;
       try {
-        await this.apis.core.deleteNamespacedPod({ name: this.activePod, namespace: this.ns });
+        await this.apis.core.deleteNamespacedPod({ name, namespace: this.ns });
+        deleteSucceeded = true;
       } catch {
         /* already gone — the reclaim sweep (Plan 4) is the backstop */
       }
       this.activePod = undefined;
+      if (deleteSucceeded) await this.waitForPodGone(name);
     }
     if (this.activeCredsSecret) {
       await this.deleteSecretBestEffort(this.activeCredsSecret);
