@@ -1,7 +1,9 @@
 /** Pod/selector label choosing which egress policy applies. */
 export const EGRESS_POLICY_LABEL = "egress-policy";
 
+/** Name of the CiliumNetworkPolicy applied to strict-egress sandbox pods. */
 export const STRICT_POLICY_NAME = "lastlight-sandbox-egress-strict";
+/** Name of the CiliumNetworkPolicy applied to open-egress sandbox pods. */
 export const OPEN_POLICY_NAME = "lastlight-sandbox-egress-open";
 
 /** Cilium CiliumNetworkPolicy CRD coordinates (client-node CustomObjectsApi). */
@@ -17,7 +19,13 @@ export const CILIUM_CNP_PLURAL = "ciliumnetworkpolicies";
  * DNS + toFQDNs rules, a strict pod can reach *only* an allowlisted FQDN's
  * resolved IP, so private space is unreachable by construction.
  */
-const PRIVATE_CIDRS_V4 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8"];
+const PRIVATE_CIDRS_V4 = [
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "169.254.0.0/16",
+  "127.0.0.0/8",
+];
 const PRIVATE_CIDRS_V6 = ["::1/128", "fc00::/7", "fe80::/10"];
 
 /** Selects the in-cluster DNS service so Cilium's DNS proxy sees the queries. */
@@ -36,10 +44,13 @@ const KUBE_DNS_SELECTOR = {
 function dnsEgressRule(): unknown {
   return {
     toEndpoints: [{ matchLabels: KUBE_DNS_SELECTOR }],
-    toPorts: [{ ports: [{ port: "53", protocol: "ANY" }], rules: { dns: [{ matchPattern: "*" }] } }],
+    toPorts: [
+      { ports: [{ port: "53", protocol: "ANY" }], rules: { dns: [{ matchPattern: "*" }] } },
+    ],
   };
 }
 
+/** Minimal shape of a Cilium `CiliumNetworkPolicy` custom resource. */
 export interface CiliumNetworkPolicy {
   apiVersion: string;
   kind: string;
@@ -53,7 +64,9 @@ export interface CiliumNetworkPolicy {
  * (the pattern alone excludes the apex). Mirrors nginx's `.host` and CoreDNS's
  * `(^|\.)host\.$` — same apex+subdomain convention, one shared source list.
  */
-export function fqdnRulesFor(hosts: readonly string[]): Array<{ matchName: string } | { matchPattern: string }> {
+export function fqdnRulesFor(
+  hosts: readonly string[],
+): Array<{ matchName: string } | { matchPattern: string }> {
   const rules: Array<{ matchName: string } | { matchPattern: string }> = [];
   for (const host of hosts) {
     rules.push({ matchName: host });
@@ -62,7 +75,12 @@ export function fqdnRulesFor(hosts: readonly string[]): Array<{ matchName: strin
   return rules;
 }
 
-function policy(name: string, namespace: string, value: "strict" | "open", egress: unknown[]): CiliumNetworkPolicy {
+function policy(
+  name: string,
+  namespace: string,
+  value: "strict" | "open",
+  egress: unknown[],
+): CiliumNetworkPolicy {
   return {
     apiVersion: `${CILIUM_GROUP}/${CILIUM_VERSION}`,
     kind: "CiliumNetworkPolicy",
@@ -72,7 +90,9 @@ function policy(name: string, namespace: string, value: "strict" | "open", egres
 }
 
 /** Strict = DNS + the allowlist FQDNs on 443/TCP; everything else default-denied. */
-export function renderStrictEgressPolicy(opts: { namespace: string; hosts: readonly string[] }): CiliumNetworkPolicy {
+export function renderStrictEgressPolicy(
+  opts: { namespace: string; hosts: readonly string[] },
+): CiliumNetworkPolicy {
   const egress = [
     dnsEgressRule(),
     { toFQDNs: fqdnRulesFor(opts.hosts), toPorts: [{ ports: [{ port: "443", protocol: "TCP" }] }] },
@@ -95,6 +115,7 @@ export function renderOpenEgressPolicy(opts: { namespace: string }): CiliumNetwo
   return policy(OPEN_POLICY_NAME, opts.namespace, "open", egress);
 }
 
+/** Render the strict/open CiliumNetworkPolicy pair for one sandbox namespace. */
 export function renderEgressPolicies(opts: {
   namespace: string;
   hosts: readonly string[];

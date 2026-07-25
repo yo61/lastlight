@@ -30,7 +30,10 @@ describe("fqdnRulesFor", () => {
 });
 
 describe("renderStrictEgressPolicy", () => {
-  const pol = renderStrictEgressPolicy({ namespace: "lastlight-sandboxes", hosts: ["github.com", "openai.com"] });
+  const pol = renderStrictEgressPolicy({
+    namespace: "lastlight-sandboxes",
+    hosts: ["github.com", "openai.com"],
+  });
 
   it("is a namespaced CiliumNetworkPolicy selecting the strict label", () => {
     expect(pol.apiVersion).toBe(`${CILIUM_GROUP}/${CILIUM_VERSION}`);
@@ -46,7 +49,8 @@ describe("renderStrictEgressPolicy", () => {
 
   it("allows DNS to kube-dns with a wildcard dns-proxy rule (so toFQDNs can resolve)", () => {
     const dns = pol.spec.egress.find(
-      (r: any) => r.toEndpoints?.[0]?.matchLabels?.["k8s:io.kubernetes.pod.namespace"] === "kube-system",
+      (r: any) =>
+        r.toEndpoints?.[0]?.matchLabels?.["k8s:io.kubernetes.pod.namespace"] === "kube-system",
     ) as any;
     expect(dns.toEndpoints[0].matchLabels["k8s-app"]).toBe("kube-dns");
     expect(dns.toPorts[0].ports).toContainEqual({ port: "53", protocol: "ANY" });
@@ -76,7 +80,13 @@ describe("renderOpenEgressPolicy", () => {
     const cidr = pol.spec.egress.find((r: any) => r.toCIDRSet) as any;
     const v4 = cidr.toCIDRSet.find((c: any) => c.cidr === "0.0.0.0/0");
     expect(v4.except).toEqual(
-      expect.arrayContaining(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8"]),
+      expect.arrayContaining([
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "127.0.0.0/8",
+      ]),
     );
     const v6 = cidr.toCIDRSet.find((c: any) => c.cidr === "::/0");
     expect(v6.except).toEqual(expect.arrayContaining(["::1/128", "fc00::/7", "fe80::/10"]));
