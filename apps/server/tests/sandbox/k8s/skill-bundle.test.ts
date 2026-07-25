@@ -70,6 +70,20 @@ describe("buildSkillTar", () => {
     rmSync(src, { recursive: true, force: true });
     rmSync(out, { recursive: true, force: true });
   });
+
+  it("throws on a duplicate sanitized name instead of silently merging", () => {
+    const src = mkdtempSync(join(tmpdir(), "skills-src-"));
+    const a = join(src, "dir-one", "pr-review");
+    const b = join(src, "dir-two", "pr-review");
+    mkdirSync(a, { recursive: true });
+    mkdirSync(b, { recursive: true });
+    writeFileSync(join(a, "SKILL.md"), "# a");
+    writeFileSync(join(b, "SKILL.md"), "# b");
+
+    expect(() => buildSkillTar([a, b])).toThrow(/duplicate skill name/);
+
+    rmSync(src, { recursive: true, force: true });
+  });
 });
 
 describe("SkillBundleRegistry", () => {

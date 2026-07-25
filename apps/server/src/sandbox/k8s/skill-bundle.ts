@@ -28,8 +28,16 @@ export function buildSkillTar(skillPaths: readonly string[]): { tar: Buffer; nam
   const staging = mkdtempSync(join(tmpdir(), "ll-skills-"));
   try {
     const names: string[] = [];
+    const seen = new Set<string>();
     for (const src of skillPaths) {
       const name = sanitizeSkillName(basename(src));
+      if (seen.has(name)) {
+        throw new Error(
+          `duplicate skill name after sanitization: "${name}" (from ${src}) — ` +
+            "skill dir basenames must be distinct",
+        );
+      }
+      seen.add(name);
       cpSync(src, join(staging, name), { recursive: true, dereference: true });
       names.push(name);
     }
@@ -45,7 +53,12 @@ export function buildSkillTar(skillPaths: readonly string[]): { tar: Buffer; nam
 /**
  * In-memory token→bundle store shared by the adapter (writer) and the
  * `/internal/skill-bundle` route (reader). A per-run token gates each Pod to
- * its own bundle; a TTL backstop drops bytes a crashed run never evicted.
+ * its own bundle. Primary reclaim is explicit: the orchestrator's run
+ * bracket calls `evict()` on both success and error. The TTL is a lazy
+ * backstop, not a timer — an expired entry is only dropped the next time its
+ * token is looked up via `get()`, so a token nobody ever queries again just
+ * sits in the Map until the process exits (bounded by process lifetime; a
+ * crash frees the whole thing).
  */
 export class SkillBundleRegistry {
   private readonly bundles = new Map<string, { tar: Buffer; expires: number }>();
