@@ -20,6 +20,8 @@ import { podNameFor } from "./naming.js";
 import { streamPodLog } from "./log-stream.js";
 import { buildPvcManifest, pvcNameFor } from "./pvc.js";
 import { buildCloneInitContainer } from "./init-clone.js";
+import { applyEgressPolicies } from "./egress-apply.js";
+import { DEFAULT_ALLOWLIST, mergeAllowlist } from "../egress-allowlist.js";
 
 type Workspace = PodSpecInput["workspace"];
 
@@ -57,6 +59,12 @@ export interface K8sAdapterConfig {
   /** Injectable fake `K8sApis` for tests; defaults to the real client. */
   apis?: K8sApis;
 }
+
+/** Ensure the egress policy pair once per namespace per process. Keyed by
+ *  namespace; a 403 (RBAC not yet granted — Plan 6) resolves after warning so
+ *  we don't re-attempt (and re-log) every run. A genuine error clears the entry
+ *  so a later run can retry. */
+const egressEnsured = new Map<string, Promise<void>>();
 
 /**
  * The `kubernetes` {@link Sandbox} adapter — one pod per `runAgent`/
@@ -133,6 +141,40 @@ export class KubernetesSandbox implements Sandbox {
 
   stageSkills(_phaseKey: string, _skillPaths: string[] | undefined): string[] | undefined {
     return undefined; // Plan 3
+  }
+
+  /** Hosts the strict policy allows — the shared allowlist plus OTEL collector
+   *  hosts when sandbox OTEL forwarding is on (mirrors `egressPolicyFor`). */
+  private strictHosts(): string[] {
+    const otel = this.opts.otel;
+    const extra = otel?.enabled && otel.forwardToSandbox ? otel.collectorHosts : [];
+    return mergeAllowlist(DEFAULT_ALLOWLIST, extra);
+  }
+
+  /** Apply the egress policy pair once per namespace. Best-effort in Plan 3:
+   *  a 403 means the CiliumNetworkPolicy RBAC verb isn't granted yet (Plan 6),
+   *  so we warn ONCE and run on Cilium's default-allow — no regression to the
+   *  validated flows; the same code enforces the moment RBAC lands. */
+  private ensureEgress(): Promise<void> {
+    let pending = egressEnsured.get(this.ns);
+    if (pending) return pending;
+    const opts = { namespace: this.ns, hosts: this.strictHosts() };
+    pending = applyEgressPolicies(this.apis.custom, opts).catch(
+      (err) => {
+        if (err instanceof ApiException && err.code === 403) {
+          console.warn(
+            `[k8s] egress policies not applied in ${this.ns}: RBAC for ` +
+              `CiliumNetworkPolicy is not granted (Plan 6). Running WITHOUT egress ` +
+              `enforcement (Cilium default-allow).`,
+          );
+          return; // resolve — don't retry/re-log every run
+        }
+        egressEnsured.delete(this.ns); // real error: allow a later run to retry
+        throw err;
+      },
+    );
+    egressEnsured.set(this.ns, pending);
+    return pending;
   }
 
   sandboxPathFor(relPath: string): string {
@@ -222,6 +264,7 @@ export class KubernetesSandbox implements Sandbox {
     const { taskId, command, env, cwd, onLine, timeoutSeconds, promptText } = input;
     const name = podNameFor(taskId, "run");
     this.activePod = name;
+    await this.ensureEgress();
 
     // Per-run creds travel in the pod's OWN Secret, never inline on the pod
     // spec (inline env is `kubectl get pod -o yaml`-visible — issue #223).
@@ -290,6 +333,7 @@ export class KubernetesSandbox implements Sandbox {
       runAsUser: this.runAsUser,
       workspace: this.workspace,
       initContainers,
+      egressPolicy: this.opts.egress.unrestricted ? "open" : "strict",
     });
     const created = await this.createPodOrCleanupSecrets(manifest, credsName, promptName);
     await this.patchSecretOwnerRefs(name, created, credsName, promptName);

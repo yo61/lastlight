@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildPodManifest, PROMPT_FILE } from "#src/sandbox/k8s/pod.js";
+import { EGRESS_POLICY_LABEL } from "#src/sandbox/k8s/egress-policy.js";
 
 describe("buildPodManifest", () => {
   const pod = buildPodManifest({
@@ -7,7 +8,7 @@ describe("buildPodManifest", () => {
     image: "ghcr.io/nearform/lastlight-sandbox:latest",
     command: ["sh", "-c", "echo hi"], envFromSecret: "ll-x-creds",
     cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800,
-    runAsUser: 10001, workspace: { kind: "emptyDir" },
+    runAsUser: 10001, workspace: { kind: "emptyDir" }, egressPolicy: "strict",
   });
   it("targets the sandbox namespace and image", () => {
     expect(pod.metadata?.namespace).toBe("lastlight-sandboxes");
@@ -28,7 +29,7 @@ describe("buildPodManifest securityContext", () => {
     image: "ghcr.io/yo61/lastlight-sandbox:latest",
     command: ["sh", "-c", "echo hi"], envFromSecret: "ll-x-creds",
     cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800,
-    runAsUser: 10001, workspace: { kind: "emptyDir" },
+    runAsUser: 10001, workspace: { kind: "emptyDir" }, egressPolicy: "strict",
   });
   it("sets a restricted-compliant pod securityContext", () => {
     expect(pod.spec?.securityContext?.runAsNonRoot).toBe(true);
@@ -49,6 +50,7 @@ describe("buildPodManifest creds via envFrom", () => {
     image: "img", command: ["sh", "-c", "true"],
     envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
     activeDeadlineSeconds: 1800, runAsUser: 10001, workspace: { kind: "emptyDir" },
+    egressPolicy: "strict",
   });
   it("pulls env from the creds Secret, not inline values", () => {
     const c = pod.spec?.containers[0];
@@ -64,7 +66,7 @@ describe("buildPodManifest prompt mount", () => {
       command: ["sh", "-c", "exec agentic-pi run --model m --sandbox none --no-session < " + PROMPT_FILE],
       envFromSecret: "ll-x-creds", promptSecret: "ll-x-prompt",
       cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800, runAsUser: 10001,
-      workspace: { kind: "emptyDir" },
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict",
     });
     const vol = pod.spec?.volumes?.find((v) => v.name === "prompt");
     expect(vol?.secret).toMatchObject({
@@ -80,7 +82,7 @@ describe("buildPodManifest prompt mount", () => {
       name: "ll-x", namespace: "lastlight-sandboxes", image: "img",
       command: ["sh", "-c", "echo hi"], envFromSecret: "ll-x-creds",
       cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800, runAsUser: 10001,
-      workspace: { kind: "emptyDir" },
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict",
     });
     expect(pod.spec?.volumes?.some((v) => v.name === "prompt")).toBe(false);
   });
@@ -94,6 +96,7 @@ describe("buildPodManifest workspace", () => {
       activeDeadlineSeconds: 1800, runAsUser: 10001,
       workspace: { kind: "pvc", claimName: "ws-acme-web-pr12" },
       initContainers: [{ name: "clone", image: "img" }],
+      egressPolicy: "strict",
     });
     const vol = pod.spec?.volumes?.find((v) => v.name === "workspace");
     expect(vol?.persistentVolumeClaim?.claimName).toBe("ws-acme-web-pr12");
@@ -104,7 +107,7 @@ describe("buildPodManifest workspace", () => {
       name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
       envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
       activeDeadlineSeconds: 1800, runAsUser: 10001,
-      workspace: { kind: "emptyDir" },
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict",
     });
     const vol = pod.spec?.volumes?.find((v) => v.name === "workspace");
     expect(vol?.emptyDir).toBeDefined();
@@ -117,8 +120,30 @@ describe("buildPodManifest workspace", () => {
       activeDeadlineSeconds: 1800, runAsUser: 10001,
       workspace: { kind: "pvc", claimName: "ws-acme-web-pr12" },
       initContainers: [{ name: "clone", image: "img" }],
+      egressPolicy: "strict",
     });
     const init = pod.spec?.initContainers?.[0];
     expect(init?.envFrom).toContainEqual({ secretRef: { name: "ll-x-creds" } });
+  });
+});
+
+describe("buildPodManifest egress label", () => {
+  it("stamps egress-policy=strict so the strict CiliumNetworkPolicy selects it", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict",
+    });
+    expect(pod.metadata?.labels?.[EGRESS_POLICY_LABEL]).toBe("strict");
+  });
+  it("stamps egress-policy=open for an unrestricted phase", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" }, egressPolicy: "open",
+    });
+    expect(pod.metadata?.labels?.[EGRESS_POLICY_LABEL]).toBe("open");
   });
 });

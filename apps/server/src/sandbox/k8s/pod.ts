@@ -1,4 +1,5 @@
 import type { V1Container, V1Pod } from "@kubernetes/client-node";
+import { EGRESS_POLICY_LABEL } from "./egress-policy.js";
 
 export const PROMPT_MOUNT_DIR = "/lastlight";
 export const PROMPT_FILE = `${PROMPT_MOUNT_DIR}/prompt`;
@@ -33,6 +34,10 @@ export interface PodSpecInput {
    *  (Task 5). Each gets the creds Secret's `envFrom` attached here so it
    *  shares the main container's `GIT_CONFIG_*` git auth. */
   initContainers?: V1Container[];
+  /** Selects which CiliumNetworkPolicy governs this pod's egress — `strict`
+   *  (the allowlist) or `open` (an `unrestricted_egress` phase). Stamped as the
+   *  `egress-policy` label the policy's endpointSelector matches. */
+  egressPolicy: "strict" | "open";
 }
 
 export function buildPodManifest(i: PodSpecInput): V1Pod {
@@ -42,7 +47,11 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
     metadata: {
       name: i.name,
       namespace: i.namespace,
-      labels: { "app.kubernetes.io/managed-by": "lastlight", "lastlight.io/component": "sandbox" },
+      labels: {
+        "app.kubernetes.io/managed-by": "lastlight",
+        "lastlight.io/component": "sandbox",
+        [EGRESS_POLICY_LABEL]: i.egressPolicy,
+      },
     },
     spec: {
       restartPolicy: "Never",

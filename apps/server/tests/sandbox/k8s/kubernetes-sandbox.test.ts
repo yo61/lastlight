@@ -2,6 +2,11 @@ import { describe, it, expect, vi } from "vitest";
 import { PassThrough } from "node:stream";
 import { ApiException } from "@kubernetes/client-node";
 import { KubernetesSandbox } from "#src/sandbox/k8s/kubernetes-sandbox.js";
+import {
+  STRICT_POLICY_NAME,
+  OPEN_POLICY_NAME,
+  EGRESS_POLICY_LABEL,
+} from "#src/sandbox/k8s/egress-policy.js";
 
 interface FakeOpts {
   /** The `V1Pod.status` object `readNamespacedPodStatus` returns. */
@@ -13,6 +18,10 @@ interface FakeOpts {
   pvcExists?: boolean;
   /** Make `createNamespacedPod` reject (pod-create failure path). */
   createPodThrows?: boolean;
+  /** Override `custom.createNamespacedCustomObject` — defaults to a spy that
+   *  resolves, so the egress-ensure call is a silent no-op in tests that
+   *  don't care about it. */
+  createNamespacedCustomObject?: ReturnType<typeof vi.fn>;
 }
 
 function fakeApis(opts: FakeOpts = {}) {
@@ -24,6 +33,8 @@ function fakeApis(opts: FakeOpts = {}) {
   const secretsPatched: any[] = [];
   const pvcsRead: any[] = [];
   const pvcsCreated: any[] = [];
+  const customCreated =
+    opts.createNamespacedCustomObject ?? vi.fn(async () => ({}));
   return {
     apis: {
       core: {
@@ -69,6 +80,9 @@ function fakeApis(opts: FakeOpts = {}) {
           return { abort() {} };
         }),
       },
+      custom: {
+        createNamespacedCustomObject: customCreated,
+      },
       kc: {} as any,
     } as any,
     created,
@@ -78,6 +92,7 @@ function fakeApis(opts: FakeOpts = {}) {
     secretsPatched,
     pvcsRead,
     pvcsCreated,
+    customCreated,
   };
 }
 
@@ -246,6 +261,41 @@ describe("KubernetesSandbox", () => {
     await sbx.provision();
     await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
     await expect(sbx.dispose()).resolves.toBeUndefined();
+  });
+});
+
+describe("KubernetesSandbox egress policy", () => {
+  // Each test uses its OWN namespace: the adapter's ensure-once cache is keyed
+  // by namespace and persists for the whole test-file run, so a shared "ns"
+  // would let an earlier test's cached ensure shadow this one's assertions.
+  it(
+    "applies the egress policy pair and labels the pod strict for a restricted phase",
+    async () => {
+      const { apis, created, customCreated } = fakeApis();
+      const sbx = new KubernetesSandbox(
+        { taskId: "t1", egress: { unrestricted: false, hosts: [] }, env: {}, stateDir: "/tmp",
+          timeoutSeconds: 60 } as any,
+        cfg(apis, { namespace: "ns-strict" }),
+      );
+      await sbx.provision();
+      await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+
+      const applied = customCreated.mock.calls.map((c: any) => c[0].body.metadata.name);
+      expect(applied).toEqual(expect.arrayContaining([STRICT_POLICY_NAME, OPEN_POLICY_NAME]));
+      expect(created[0].metadata.labels[EGRESS_POLICY_LABEL]).toBe("strict");
+    },
+  );
+
+  it("labels the pod open for an unrestricted phase", async () => {
+    const { apis, created } = fakeApis();
+    const sbx = new KubernetesSandbox(
+      { taskId: "t2", egress: { unrestricted: true, hosts: [] }, env: {}, stateDir: "/tmp",
+        timeoutSeconds: 60 } as any,
+      cfg(apis, { namespace: "ns-open" }),
+    );
+    await sbx.provision();
+    await sbx.runCommand("t2", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+    expect(created[0].metadata.labels[EGRESS_POLICY_LABEL]).toBe("open");
   });
 });
 
