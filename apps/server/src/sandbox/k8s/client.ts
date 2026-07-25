@@ -1,7 +1,10 @@
-import { KubeConfig, CoreV1Api, Log } from "@kubernetes/client-node";
+import { KubeConfig, CoreV1Api, CustomObjectsApi, Log } from "@kubernetes/client-node";
 
 export interface K8sApis {
   core: CoreV1Api;
+  /** CiliumNetworkPolicy (cilium.io/v2) lives off the core API — needs the
+   *  generic custom-objects client. */
+  custom: CustomObjectsApi;
   log: Log;
   kc: KubeConfig;
 }
@@ -23,7 +26,12 @@ export function inClusterConfigAvailable(env: NodeJS.ProcessEnv = process.env): 
  *  otherwise the local kubeconfig for dev. Pass an explicit `kc` in tests. */
 export function makeK8sApis(kc?: KubeConfig): K8sApis {
   const config = kc ?? loadInClusterOrDefault();
-  return { core: config.makeApiClient(CoreV1Api), log: new Log(config), kc: config };
+  return {
+    core: config.makeApiClient(CoreV1Api),
+    custom: config.makeApiClient(CustomObjectsApi),
+    log: new Log(config),
+    kc: config,
+  };
 }
 
 function loadInClusterOrDefault(): KubeConfig {

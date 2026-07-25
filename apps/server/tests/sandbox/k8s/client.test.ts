@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { KubeConfig } from "@kubernetes/client-node";
+import { KubeConfig, CustomObjectsApi } from "@kubernetes/client-node";
 import { makeK8sApis, inClusterConfigAvailable } from "#src/sandbox/k8s/client.js";
 
 describe("makeK8sApis", () => {
@@ -14,6 +14,18 @@ describe("makeK8sApis", () => {
     const apis = makeK8sApis(kc);
     expect(apis.core).toBeDefined();
     expect(apis.log).toBeDefined();
+  });
+
+  it("exposes a CustomObjectsApi client for CiliumNetworkPolicy", () => {
+    const kc = new KubeConfig();
+    kc.loadFromOptions({
+      clusters: [{ name: "c", server: "https://example.test" }],
+      users: [{ name: "u" }],
+      contexts: [{ name: "ctx", cluster: "c", user: "u" }],
+      currentContext: "ctx",
+    });
+    const apis = makeK8sApis(kc);
+    expect(apis.custom).toBeInstanceOf(CustomObjectsApi);
   });
 });
 
