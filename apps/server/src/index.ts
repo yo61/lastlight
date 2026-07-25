@@ -25,6 +25,8 @@ import {
 } from "./cron/dependabot-discovery.js";
 import { mountAdmin } from "./admin/index.js";
 import { cleanupOrphanedSandboxes } from "./sandbox/index.js";
+import { mountSkillBundle } from "./sandbox/k8s/skill-bundle-route.js";
+import { skillBundleRegistry } from "./sandbox/k8s/skill-bundle.js";
 import { writeEgressFirewallConfigs, writeOtelCollectorConfig } from "./sandbox/egress-firewall-config.js";
 import { initTelemetry, shutdownTelemetry } from "./telemetry/index.js";
 import { authMiddleware, authIsEnabled, actorFromContext } from "./admin/auth.js";
@@ -693,6 +695,7 @@ async function main() {
   // (src/cli/cli.ts, cli-server.ts).
   const app = new Hono();
   app.get("/health", (c) => c.json({ status: "ok" }));
+  mountSkillBundle(app, skillBundleRegistry);
 
   // GitHub webhook connector (optional — requires both webhook secret and GitHub
   // App). It registers /webhooks/github onto the shared app; it no longer owns
