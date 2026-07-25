@@ -1,12 +1,16 @@
 import { describe, it, expect, vi } from "vitest";
 import { PassThrough } from "node:stream";
 import { ApiException } from "@kubernetes/client-node";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { KubernetesSandbox } from "#src/sandbox/k8s/kubernetes-sandbox.js";
 import {
   STRICT_POLICY_NAME,
   OPEN_POLICY_NAME,
   EGRESS_POLICY_LABEL,
 } from "#src/sandbox/k8s/egress-policy.js";
+import { SkillBundleRegistry } from "#src/sandbox/k8s/skill-bundle.js";
 
 interface FakeOpts {
   /** The `V1Pod.status` object `readNamespacedPodStatus` returns. */
@@ -105,7 +109,7 @@ const factoryOpts = {
 } as any;
 
 /** Full `K8sAdapterConfig` — `storageClassName`/`workspaceSize`/`runAsUser`
- *  are required as of Task 6. */
+ *  are required as of Task 6, as are the three `harness*` fields. */
 function cfg(apis: any, overrides: Partial<Record<string, unknown>> = {}) {
   return {
     namespace: "ns",
@@ -113,6 +117,9 @@ function cfg(apis: any, overrides: Partial<Record<string, unknown>> = {}) {
     storageClassName: "truenas-iscsi",
     workspaceSize: "5Gi",
     runAsUser: 10001,
+    harnessEndpoint: "http://lastlight.lastlight.svc.cluster.local:8644",
+    harnessNamespace: "lastlight",
+    harnessPodLabels: { "app.kubernetes.io/name": "lastlight" },
     apis,
     ...overrides,
   };
@@ -544,5 +551,74 @@ describe("KubernetesSandbox (creds + workspace + prompt)", () => {
     const promptName = secretsCreated.find((s: any) => s.metadata.name.endsWith("-prompt")).metadata
       .name;
     expect(secretsDeleted).toEqual(expect.arrayContaining([credsName, promptName]));
+  });
+});
+
+describe("KubernetesSandbox skills staging", () => {
+  it("stages a bundle, wires init + token + --skill, evicts on dispose", async () => {
+    const src = mkdtempSync(join(tmpdir(), "skills-src-"));
+    const skillSrc = join(src, "pr-review");
+    mkdirSync(skillSrc, { recursive: true });
+    writeFileSync(join(skillSrc, "SKILL.md"), "# pr-review");
+
+    try {
+      const { apis, created, secretsCreated } = fakeApis();
+      const skillRegistry = new SkillBundleRegistry();
+      const sbx = new KubernetesSandbox(
+        {
+          taskId: "t-skills",
+          egress: { unrestricted: false, hosts: [] },
+          env: {},
+          stateDir: "/tmp",
+          timeoutSeconds: 60,
+        } as any,
+        cfg(apis, { namespace: "ns-skills", skillRegistry }),
+      );
+      await sbx.provision();
+      const dirs = sbx.stageSkills("pr-review", [skillSrc]);
+      expect(dirs).toEqual(["/lastlight-skills/pr-review"]);
+
+      await sbx.runAgent(
+        "t-skills",
+        "hello",
+        {
+          model: "anthropic/x",
+          sandboxEnv: {},
+          agentCwd: "/home/agent/workspace",
+          skillDirs: dirs,
+        } as any,
+        () => {},
+      );
+
+      const pod = created[0];
+      expect(pod.spec.initContainers.some((c: any) => c.name === "skills")).toBe(true);
+      expect(pod.spec.volumes.some((v: any) => v.name === "skills")).toBe(true);
+      const cmd = pod.spec.containers[0].command.join(" ");
+      expect(cmd).toContain("--skill /lastlight-skills/pr-review");
+      const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
+      const token = creds.stringData.LASTLIGHT_SKILL_TOKEN;
+      expect(token).toBeTruthy();
+      expect(skillRegistry.get(token)).toBeDefined();
+
+      await sbx.dispose();
+      expect(skillRegistry.get(token)).toBeUndefined();
+    } finally {
+      rmSync(src, { recursive: true, force: true });
+    }
+  });
+
+  it("runCommand stages no skills: no init, no token, no --skill", async () => {
+    const { apis, created, secretsCreated } = fakeApis();
+    const skillRegistry = new SkillBundleRegistry();
+    const overrides = { namespace: "ns-no-skills", skillRegistry };
+    const sbx = new KubernetesSandbox(factoryOpts, cfg(apis, overrides));
+    await sbx.provision();
+    await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+
+    const pod = created[0];
+    expect(pod.spec.initContainers ?? []).toHaveLength(0);
+    const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
+    expect(creds.stringData.LASTLIGHT_SKILL_TOKEN).toBeUndefined();
+    expect(pod.spec.containers[0].command.join(" ")).not.toContain("--skill");
   });
 });

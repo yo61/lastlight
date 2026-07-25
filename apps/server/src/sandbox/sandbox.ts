@@ -244,6 +244,9 @@ export function sandboxFor(backend: SandboxBackend, opts: SandboxFactoryOpts): S
         storageClassName: k.storageClassName,
         workspaceSize: k.workspaceSize,
         runAsUser: k.runAsUser,
+        harnessEndpoint: k.harnessEndpoint,
+        harnessNamespace: k.harnessNamespace,
+        harnessPodLabels: k.harnessPodLabels,
       });
     }
   }

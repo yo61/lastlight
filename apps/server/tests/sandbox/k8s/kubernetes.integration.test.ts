@@ -12,6 +12,10 @@ const RUN = process.env.RUN_K8S_IT === "1";
 const IMAGE = process.env.K8S_SANDBOX_IMAGE ??
   "ghcr.io/yo61/lastlight-sandbox:latest";
 const HAS_AI = !!process.env.ANTHROPIC_API_KEY;
+const HARNESS_ENDPOINT = process.env.LASTLIGHT_K8S_HARNESS_ENDPOINT ??
+  "http://lastlight.lastlight.svc.cluster.local:8644";
+const HARNESS_NAMESPACE = process.env.LASTLIGHT_K8S_HARNESS_NAMESPACE ?? "lastlight";
+const HARNESS_POD_LABELS = { "app.kubernetes.io/name": "lastlight" };
 
 /** True once the strict CiliumNetworkPolicy has actually been applied in
  *  `namespace` — false when the apply 403'd (RBAC not yet granted, Plan 6)
@@ -59,6 +63,9 @@ describe.runIf(RUN)("KubernetesSandbox Plan 1 (integration)", () => {
             process.env.LASTLIGHT_K8S_RUN_AS_USER ?? "10001",
             10,
           ),
+          harnessEndpoint: HARNESS_ENDPOINT,
+          harnessNamespace: HARNESS_NAMESPACE,
+          harnessPodLabels: HARNESS_POD_LABELS,
         },
       );
       await sbx.provision();
@@ -98,6 +105,9 @@ describe.runIf(RUN)("KubernetesSandbox Plan 2 (integration)", () => {
           process.env.LASTLIGHT_K8S_RUN_AS_USER ?? "10001",
           10,
         ),
+        harnessEndpoint: HARNESS_ENDPOINT,
+        harnessNamespace: HARNESS_NAMESPACE,
+        harnessPodLabels: HARNESS_POD_LABELS,
       },
     );
 
@@ -192,6 +202,9 @@ describe.runIf(RUN)("KubernetesSandbox Plan 3 egress (integration)", () => {
           process.env.LASTLIGHT_K8S_RUN_AS_USER ?? "10001",
           10,
         ),
+        harnessEndpoint: HARNESS_ENDPOINT,
+        harnessNamespace: HARNESS_NAMESPACE,
+        harnessPodLabels: HARNESS_POD_LABELS,
       },
     );
 

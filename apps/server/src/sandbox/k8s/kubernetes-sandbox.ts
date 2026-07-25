@@ -1,5 +1,5 @@
 import { ApiException } from "@kubernetes/client-node";
-import type { V1ContainerStatus, V1Pod } from "@kubernetes/client-node";
+import type { V1Container, V1ContainerStatus, V1Pod } from "@kubernetes/client-node";
 import type { RunResult } from "agentic-pi";
 import type {
   Sandbox,
@@ -20,8 +20,16 @@ import { podNameFor } from "./naming.js";
 import { streamPodLog } from "./log-stream.js";
 import { buildPvcManifest, pvcNameFor } from "./pvc.js";
 import { buildCloneInitContainer } from "./init-clone.js";
+import { buildSkillsInitContainer } from "./init-skills.js";
 import { applyEgressPolicies } from "./egress-apply.js";
 import { DEFAULT_ALLOWLIST, mergeAllowlist } from "../egress-allowlist.js";
+import type { HarnessSelector } from "./egress-policy.js";
+import {
+  buildSkillTar,
+  skillBundleRegistry,
+  SKILLS_MOUNT_DIR,
+  type SkillBundleRegistry,
+} from "./skill-bundle.js";
 
 type Workspace = PodSpecInput["workspace"];
 
@@ -48,16 +56,23 @@ const FATAL_WAITING_REASONS = new Set([
 
 /** Config the adapter needs. `storageClassName` / `workspaceSize` size and
  *  class the per-(repo,PR) PVC (Task 5); `runAsUser` is the pod and
- *  initContainer security-context UID. The factory (`sandbox.ts`) resolves
- *  and passes all five fields via `resolveKubernetesConfig()`. */
+ *  initContainer security-context UID. `harnessEndpoint` / `harnessNamespace`
+ *  / `harnessPodLabels` locate the harness Pod the skills-init fetches the
+ *  bundle from (Task 3/6). The factory (`sandbox.ts`) resolves and passes all
+ *  of these via `resolveKubernetesConfig()`. */
 export interface K8sAdapterConfig {
   namespace: string;
   image: string;
   storageClassName: string;
   workspaceSize: string;
   runAsUser: number;
+  harnessEndpoint: string;
+  harnessNamespace: string;
+  harnessPodLabels: Record<string, string>;
   /** Injectable fake `K8sApis` for tests; defaults to the real client. */
   apis?: K8sApis;
+  /** Injectable registry for tests; defaults to the module singleton skillBundleRegistry. */
+  skillRegistry?: SkillBundleRegistry;
 }
 
 /** Ensure the egress policy pair once per namespace per process. Keyed by
@@ -77,7 +92,10 @@ const egressEnsured = new Map<string, Promise<void>>();
  * `envFrom`/volume mount names a missing Secret fails to start); once the Pod
  * exists, each Secret's `ownerReferences` is patched to the Pod's uid so
  * deleting the Pod cascade-GCs them — `dispose` also best-effort deletes them
- * directly as a backstop. `stageSkills` is still a stub (Plan 3).
+ * directly as a backstop. `stageSkills` tars the resolved skill dirs and
+ * registers the bundle with the (injectable) skill registry; `runPod` then
+ * carries the fetch token into the creds Secret and adds a skills initContainer
+ * that pulls it from the harness's `/internal/skill-bundle` route.
  */
 export class KubernetesSandbox implements Sandbox {
   readonly backend: SandboxBackend = "kubernetes";
@@ -87,6 +105,10 @@ export class KubernetesSandbox implements Sandbox {
   private readonly runAsUser: number;
   private readonly storageClassName: string;
   private readonly workspaceSize: string;
+  private readonly harnessEndpoint: string;
+  private readonly harnessNamespace: string;
+  private readonly harnessPodLabels: Record<string, string>;
+  private readonly skillRegistry: SkillBundleRegistry;
   private activePod?: string;
   private activeCredsSecret?: string;
   private activePromptSecret?: string;
@@ -94,6 +116,10 @@ export class KubernetesSandbox implements Sandbox {
    *  needs the repo coordinates to build the clone initContainer. */
   private pre?: PrePopulateSpec;
   private workspace: Workspace = { kind: "emptyDir" };
+  /** Fetch token for the bundle staged by the last `stageSkills()` call, if
+   *  any — `runPod` needs it for the creds Secret + skills-init; `dispose`
+   *  evicts it from the registry. */
+  private skillToken?: string;
 
   constructor(
     private readonly opts: SandboxFactoryOpts,
@@ -105,6 +131,10 @@ export class KubernetesSandbox implements Sandbox {
     this.runAsUser = cfg.runAsUser;
     this.storageClassName = cfg.storageClassName;
     this.workspaceSize = cfg.workspaceSize;
+    this.harnessEndpoint = cfg.harnessEndpoint;
+    this.harnessNamespace = cfg.harnessNamespace;
+    this.harnessPodLabels = cfg.harnessPodLabels;
+    this.skillRegistry = cfg.skillRegistry ?? skillBundleRegistry;
   }
 
   async provision(pre?: PrePopulateSpec): Promise<ProvisionResult> {
@@ -139,8 +169,21 @@ export class KubernetesSandbox implements Sandbox {
     });
   }
 
-  stageSkills(_phaseKey: string, _skillPaths: string[] | undefined): string[] | undefined {
-    return undefined; // Plan 3
+  /**
+   * Package `skillPaths` into a tar, register it in the (injectable) skill
+   * registry, and return the in-pod dirs the agent should `--skill` against.
+   * `runPod` reads `this.skillToken` back off the instance to wire the creds
+   * Secret + skills-init; the orchestrator also threads the returned dirs
+   * back in as `opts.skillDirs` for the `runAgent` command (Task 6 brief).
+   * Deduped: `buildSkillTar` doesn't dedupe sanitized-name collisions
+   * (two skill dirs whose basenames sanitize equal merge in the tar), so a
+   * `Set` here at least keeps the returned `--skill` list free of repeats.
+   */
+  stageSkills(_phaseKey: string, skillPaths: string[] | undefined): string[] | undefined {
+    const { tar, names } = buildSkillTar(skillPaths ?? []);
+    if (!names.length) return undefined;
+    this.skillToken = this.skillRegistry.register(tar);
+    return [...new Set(names)].map((n) => `${SKILLS_MOUNT_DIR}/${n}`);
   }
 
   /** Hosts the strict policy allows — the shared allowlist plus OTEL collector
@@ -158,7 +201,13 @@ export class KubernetesSandbox implements Sandbox {
   private ensureEgress(): Promise<void> {
     let pending = egressEnsured.get(this.ns);
     if (pending) return pending;
-    const opts = { namespace: this.ns, hosts: this.strictHosts() };
+    const port = Number(new URL(this.harnessEndpoint).port) || 8644;
+    const harness: HarnessSelector = {
+      namespace: this.harnessNamespace,
+      labels: this.harnessPodLabels,
+      port,
+    };
+    const opts = { namespace: this.ns, hosts: this.strictHosts(), harness };
     pending = applyEgressPolicies(this.apis.custom, opts).catch(
       (err) => {
         if (err instanceof ApiException && err.code === 403) {
@@ -193,8 +242,13 @@ export class KubernetesSandbox implements Sandbox {
     // `sh`, NOT interpolated into the script text — the same
     // command-injection class `init-clone.ts` guards against for
     // owner/repo/branch: `sh -c SCRIPT sh <model>` binds argv to `$1` at exec
-    // time, immune to quote-breaking regardless of characters.
-    const script = `exec agentic-pi run --model "$1" --sandbox none --no-session < ${PROMPT_FILE}`;
+    // time, immune to quote-breaking regardless of characters. Each skill dir
+    // is already `${SKILLS_MOUNT_DIR}/<sanitized-name>` (stageSkills), so
+    // splicing it into the script text is safe.
+    const skillFlags = (opts.skillDirs ?? []).map((d) => `--skill ${d}`).join(" ");
+    const script =
+      `exec agentic-pi run --model "$1" --sandbox none --no-session ${skillFlags} ` +
+      `< ${PROMPT_FILE}`;
     await this.runPod({
       taskId,
       command: ["sh", "-c", script, "sh", opts.model],
@@ -269,15 +323,20 @@ export class KubernetesSandbox implements Sandbox {
     // Per-run creds travel in the pod's OWN Secret, never inline on the pod
     // spec (inline env is `kubectl get pod -o yaml`-visible — issue #223).
     // Must be created BEFORE the pod: a pod whose envFrom names a missing
-    // Secret fails to start.
+    // Secret fails to start. When `stageSkills` staged a bundle, its fetch
+    // token rides along in the same map so the skills-init reads it via the
+    // same `envFrom` the main container gets.
     const credsName = secretNameFor(name, "creds");
     this.activeCredsSecret = credsName;
+    const credsData = this.skillToken
+      ? { ...env, LASTLIGHT_SKILL_TOKEN: this.skillToken }
+      : env;
     await this.apis.core.createNamespacedSecret({
       namespace: this.ns,
       body: buildSecretManifest({
         name: credsName,
         namespace: this.ns,
-        data: env,
+        data: credsData,
         labels: { "lastlight.io/pod": name },
       }),
     });
@@ -303,19 +362,29 @@ export class KubernetesSandbox implements Sandbox {
     // Minimal clone init (locked decision #2) — only when this run has a PVC
     // workspace AND a pre-clone descriptor (an ephemeral emptyDir run has
     // nothing to clone into). Cloned coordinates come from `this.pre`, stashed
-    // by the last `provision()` call.
-    const initContainers =
-      this.workspace.kind === "pvc" && this.pre
-        ? [
-            buildCloneInitContainer(this.image, {
-              owner: this.pre.owner,
-              repo: this.pre.repo,
-              branch: this.pre.branch,
-              cwd: WORKSPACE_DIR,
-              runAsUser: this.runAsUser,
-            }),
-          ]
-        : undefined;
+    // by the last `provision()` call. The skills init runs alongside it
+    // whenever `stageSkills` staged a bundle for this run — both coexist,
+    // and `buildPodManifest` attaches the creds Secret's `envFrom` to each.
+    const initContainers: V1Container[] = [];
+    if (this.workspace.kind === "pvc" && this.pre) {
+      initContainers.push(
+        buildCloneInitContainer(this.image, {
+          owner: this.pre.owner,
+          repo: this.pre.repo,
+          branch: this.pre.branch,
+          cwd: WORKSPACE_DIR,
+          runAsUser: this.runAsUser,
+        }),
+      );
+    }
+    if (this.skillToken) {
+      initContainers.push(
+        buildSkillsInitContainer(this.image, {
+          endpoint: this.harnessEndpoint,
+          runAsUser: this.runAsUser,
+        }),
+      );
+    }
 
     // Wall-clock cap: activeDeadlineSeconds kills the pod at the per-call
     // budget (runCommand threads its RunCommandOpts.timeoutSeconds; runAgent
@@ -334,6 +403,7 @@ export class KubernetesSandbox implements Sandbox {
       workspace: this.workspace,
       initContainers,
       egressPolicy: this.opts.egress.unrestricted ? "open" : "strict",
+      skillsMount: this.skillToken !== undefined,
     });
     const created = await this.createPodOrCleanupSecrets(manifest, credsName, promptName);
     await this.patchSecretOwnerRefs(name, created, credsName, promptName);
@@ -508,6 +578,10 @@ export class KubernetesSandbox implements Sandbox {
     if (this.activePromptSecret) {
       await this.deleteSecretBestEffort(this.activePromptSecret);
       this.activePromptSecret = undefined;
+    }
+    if (this.skillToken) {
+      this.skillRegistry.evict(this.skillToken);
+      this.skillToken = undefined;
     }
   }
 }
