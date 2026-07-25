@@ -33,7 +33,7 @@ export function buildSkillTar(skillPaths: readonly string[]): { tar: Buffer; nam
       cpSync(src, join(staging, name), { recursive: true, dereference: true });
       names.push(name);
     }
-    const tar = execFileSync("tar", ["-czf", "-", "-C", staging, ...names], {
+    const tar = execFileSync("tar", ["-czf", "-", "-C", staging, "--", ...names], {
       maxBuffer: 16 * 1024 * 1024,
     });
     return { tar, names };

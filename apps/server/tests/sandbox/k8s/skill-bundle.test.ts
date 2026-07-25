@@ -45,6 +45,31 @@ describe("buildSkillTar", () => {
   it("returns an empty bundle for no skills", () => {
     expect(buildSkillTar([])).toEqual({ tar: Buffer.alloc(0), names: [] });
   });
+
+  it("handles a sanitized name that starts with a dash (tar option-injection guard)", () => {
+    const src = mkdtempSync(join(tmpdir(), "skills-src-"));
+    // sanitizeSkillName("-rf") === "-rf" — a leading-dash name must not be
+    // parsed as a tar flag.
+    const a = join(src, "-rf");
+    mkdirSync(a, { recursive: true });
+    writeFileSync(join(a, "SKILL.md"), "# dash-named skill");
+
+    let result: { tar: Buffer; names: string[] } | undefined;
+    expect(() => {
+      result = buildSkillTar([a]);
+    }).not.toThrow();
+    expect(result?.names).toEqual(["-rf"]);
+    expect(result?.tar.length).toBeGreaterThan(0);
+
+    const out = mkdtempSync(join(tmpdir(), "skills-out-"));
+    const tarPath = join(out, "b.tgz");
+    writeFileSync(tarPath, result?.tar as Buffer);
+    execFileSync("tar", ["xzf", tarPath, "-C", out]);
+    expect(() => execFileSync("cat", [join(out, "-rf", "SKILL.md")])).not.toThrow();
+
+    rmSync(src, { recursive: true, force: true });
+    rmSync(out, { recursive: true, force: true });
+  });
 });
 
 describe("SkillBundleRegistry", () => {
