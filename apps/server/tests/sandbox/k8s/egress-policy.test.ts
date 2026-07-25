@@ -143,8 +143,18 @@ describe("toEndpoints harness rule", () => {
       hosts: ["github.com"],
       harness,
     });
-    expect(strict.spec.egress.some((r: any) => r.toEndpoints)).toBe(true);
-    expect(open.spec.egress.some((r: any) => r.toEndpoints)).toBe(true);
+    // DNS also uses toEndpoints (to kube-dns) — narrow to the harness-labelled
+    // rule so this actually guards `harness` forwarding, not just DNS's presence.
+    expect(
+      strict.spec.egress.some(
+        (r: any) => r.toEndpoints?.[0]?.matchLabels?.["app.kubernetes.io/name"] === "lastlight",
+      ),
+    ).toBe(true);
+    expect(
+      open.spec.egress.some(
+        (r: any) => r.toEndpoints?.[0]?.matchLabels?.["app.kubernetes.io/name"] === "lastlight",
+      ),
+    ).toBe(true);
   });
 
   it("omitted harness renders no toEndpoints-for-harness rule (Task-6 closes this)", () => {
