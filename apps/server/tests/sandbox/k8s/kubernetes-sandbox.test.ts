@@ -368,6 +368,58 @@ describe("KubernetesSandbox egress policy", () => {
       expect(create.mock.calls.length).toBeGreaterThan(1);
     },
   );
+
+  it("builds the harness toEndpoints rule from an endpoint with an explicit port", async () => {
+    const { apis, customCreated } = fakeApis();
+    const sbx = new KubernetesSandbox(
+      factoryOpts,
+      cfg(apis, {
+        namespace: "ns-harness-port",
+        harnessEndpoint: "http://h.ns.svc:9000",
+        harnessNamespace: "ll-sys",
+        harnessPodLabels: { app: "lastlight" },
+      }),
+    );
+    await sbx.provision();
+    await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+
+    const strictBody = customCreated.mock.calls
+      .map((c: any) => c[0].body)
+      .find((b: any) => b.metadata.name === STRICT_POLICY_NAME);
+    expect(strictBody).toBeDefined();
+    // The DNS rule also has a `toEndpoints` — filter to the harness one by
+    // its distinctive `app` label (same gotcha noted in Task 4).
+    const harnessRule = strictBody.spec.egress.find(
+      (rule: any) => rule.toEndpoints?.[0]?.matchLabels?.app === "lastlight",
+    );
+    expect(harnessRule).toBeDefined();
+    expect(harnessRule.toEndpoints[0].matchLabels).toMatchObject({
+      "k8s:io.kubernetes.pod.namespace": "ll-sys",
+      app: "lastlight",
+    });
+    expect(harnessRule.toPorts[0].ports).toContainEqual({ port: "9000", protocol: "TCP" });
+  });
+
+  it("falls back to port 8644 when the harness endpoint has no explicit port", async () => {
+    const { apis, customCreated } = fakeApis();
+    const sbx = new KubernetesSandbox(
+      factoryOpts,
+      cfg(apis, { namespace: "ns-harness-noport", harnessEndpoint: "http://h.ns.svc" }),
+    );
+    await sbx.provision();
+    await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+
+    const strictBody = customCreated.mock.calls
+      .map((c: any) => c[0].body)
+      .find((b: any) => b.metadata.name === STRICT_POLICY_NAME);
+    expect(strictBody).toBeDefined();
+    // cfg()'s default harnessPodLabels key distinguishes this from the DNS rule.
+    const harnessRule = strictBody.spec.egress.find(
+      (rule: any) => rule.toEndpoints?.[0]?.matchLabels?.["app.kubernetes.io/name"] === "lastlight",
+    );
+    expect(harnessRule).toBeDefined();
+    expect(harnessRule.toPorts[0].ports).toContainEqual({ port: "8644", protocol: "TCP" });
+  });
 });
 
 describe("KubernetesSandbox PVC workspace (pre-clone)", () => {
