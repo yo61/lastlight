@@ -1,5 +1,6 @@
 import type { V1Container, V1Pod } from "@kubernetes/client-node";
 import { EGRESS_POLICY_LABEL } from "./egress-policy.js";
+import { SKILLS_MOUNT_DIR } from "./skill-bundle.js";
 
 export const PROMPT_MOUNT_DIR = "/lastlight";
 export const PROMPT_FILE = `${PROMPT_MOUNT_DIR}/prompt`;
@@ -38,6 +39,10 @@ export interface PodSpecInput {
    *  (the allowlist) or `open` (an `unrestricted_egress` phase). Stamped as the
    *  `egress-policy` label the policy's endpointSelector matches. */
   egressPolicy: "strict" | "open";
+  /** When set, add a `skills` emptyDir shared with the skills initContainer and
+   *  mount it at SKILLS_MOUNT_DIR in the agent container (the initContainer,
+   *  passed in `initContainers`, unpacks the fetched bundle into it). */
+  skillsMount?: boolean;
 }
 
 export function buildPodManifest(i: PodSpecInput): V1Pod {
@@ -75,6 +80,7 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
         ...(i.promptSecret
           ? [{ name: "prompt", secret: { secretName: i.promptSecret, items: [{ key: "prompt", path: "prompt" }] } }]
           : []),
+        ...(i.skillsMount ? [{ name: "skills", emptyDir: {} }] : []),
       ],
       ...(i.initContainers && i.initContainers.length
         ? {
@@ -95,6 +101,7 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
           volumeMounts: [
             { name: "workspace", mountPath: WORKSPACE_DIR },
             ...(i.promptSecret ? [{ name: "prompt", mountPath: PROMPT_MOUNT_DIR, readOnly: true }] : []),
+            ...(i.skillsMount ? [{ name: "skills", mountPath: SKILLS_MOUNT_DIR }] : []),
           ],
           securityContext: {
             allowPrivilegeEscalation: false,

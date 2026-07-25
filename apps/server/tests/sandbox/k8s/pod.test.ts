@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildPodManifest, PROMPT_FILE } from "#src/sandbox/k8s/pod.js";
 import { EGRESS_POLICY_LABEL } from "#src/sandbox/k8s/egress-policy.js";
+import { SKILLS_MOUNT_DIR } from "#src/sandbox/k8s/skill-bundle.js";
 
 describe("buildPodManifest", () => {
   const pod = buildPodManifest({
@@ -145,5 +146,33 @@ describe("buildPodManifest egress label", () => {
       workspace: { kind: "emptyDir" }, egressPolicy: "open",
     });
     expect(pod.metadata?.labels?.[EGRESS_POLICY_LABEL]).toBe("open");
+  });
+});
+
+describe("buildPodManifest skills mount", () => {
+  it("adds a skills emptyDir + mounts it in the agent container when skillsMount is set", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict", skillsMount: true,
+      initContainers: [{ name: "skills", image: "img" }],
+    });
+    const vol = pod.spec?.volumes?.find((v) => v.name === "skills");
+    expect(vol?.emptyDir).toBeDefined();
+    const mount = pod.spec?.containers[0].volumeMounts?.find((m) => m.name === "skills");
+    expect(mount?.mountPath).toBe(SKILLS_MOUNT_DIR);
+    expect(pod.spec?.initContainers?.some((c) => c.name === "skills")).toBe(true);
+  });
+
+  it("omits the skills volume when skillsMount is not set", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict",
+    });
+    expect(pod.spec?.volumes?.some((v) => v.name === "skills")).toBe(false);
+    expect(pod.spec?.containers[0].volumeMounts?.some((m) => m.name === "skills")).toBe(false);
   });
 });
