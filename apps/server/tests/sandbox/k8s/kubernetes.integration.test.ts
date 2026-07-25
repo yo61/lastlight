@@ -208,11 +208,16 @@ describe.runIf(RUN)("KubernetesSandbox Plan 3 egress (integration)", () => {
         // host must fail under the strict policy. Each `||`/`&&` branch keeps
         // the overall command exit 0 so we assert on stdout, not the pod's
         // exit code (a non-zero exit would throw before we get to inspect it).
+        // The EVIL curl omits `-w "%{http_code}"`: on a blocked connection curl
+        // prints "000" for that format before the shell hits `||`, which would
+        // land between "evil=" and "BLOCKED" and break the toContain match. The
+        // GITHUB curl keeps `-w` since its failure branch is an unexpected-error
+        // case that should fail the test, not something this test massages.
         const script = [
           'echo -n "github="; curl -sS -m 8 -o /dev/null -w "%{http_code}" ' +
             'https://api.github.com/ || echo -n "ERR"',
-          'echo; echo -n "evil="; curl -sS -m 8 -o /dev/null -w "%{http_code}" ' +
-            'https://example.com/ && echo || echo BLOCKED',
+          'echo; echo -n "evil="; curl -sS -m 8 -o /dev/null ' +
+            'https://example.com/ && echo -n "OK" || echo -n "BLOCKED"',
         ].join("; ");
         const result = await sbx.runCommand(taskId, script, {
           cwd: "/home/agent/workspace",
