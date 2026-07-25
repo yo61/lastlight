@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { PassThrough } from "node:stream";
+import { ApiException } from "@kubernetes/client-node";
 import { KubernetesSandbox } from "#src/sandbox/k8s/kubernetes-sandbox.js";
 
 interface FakeOpts {
@@ -7,6 +8,9 @@ interface FakeOpts {
   status?: Record<string, unknown>;
   /** Make `deleteNamespacedPod` reject. */
   deleteThrows?: boolean;
+  /** Make `readNamespacedPersistentVolumeClaim` resolve (PVC already exists)
+   *  instead of the default 404-reject (PVC missing, must be created). */
+  pvcExists?: boolean;
 }
 
 function fakeApis(opts: FakeOpts = {}) {
@@ -15,6 +19,8 @@ function fakeApis(opts: FakeOpts = {}) {
   const deleted: string[] = [];
   const secretsCreated: any[] = [];
   const secretsDeleted: string[] = [];
+  const pvcsRead: any[] = [];
+  const pvcsCreated: any[] = [];
   return {
     apis: {
       core: {
@@ -36,6 +42,15 @@ function fakeApis(opts: FakeOpts = {}) {
           secretsDeleted.push(name);
           return {};
         }),
+        readNamespacedPersistentVolumeClaim: vi.fn(async ({ name, namespace }: any) => {
+          pvcsRead.push({ name, namespace });
+          if (opts.pvcExists) return { metadata: { name, namespace } };
+          throw new ApiException(404, "Not Found", {}, {});
+        }),
+        createNamespacedPersistentVolumeClaim: vi.fn(async ({ body }: any) => {
+          pvcsCreated.push(body);
+          return body;
+        }),
       },
       log: {
         log: vi.fn(async (_n: string, _p: string, _c: string, s: PassThrough) => {
@@ -50,6 +65,8 @@ function fakeApis(opts: FakeOpts = {}) {
     deleted,
     secretsCreated,
     secretsDeleted,
+    pvcsRead,
+    pvcsCreated,
   };
 }
 
@@ -63,13 +80,17 @@ const factoryOpts = {
 
 describe("KubernetesSandbox", () => {
   it("runAgent creates a pod, streams parsed events, and deletes the pod", async () => {
-    const { apis, created, deleted, secretsCreated, secretsDeleted } = fakeApis();
+    const { apis, created, deleted, secretsCreated, secretsDeleted, pvcsRead, pvcsCreated } =
+      fakeApis();
     const sbx = new KubernetesSandbox(factoryOpts, {
       namespace: "lastlight-sandboxes",
       image: "img",
       apis,
     });
     await sbx.provision();
+    // No pre-clone descriptor — ephemeral emptyDir workspace, no PVC touched.
+    expect(pvcsRead).toHaveLength(0);
+    expect(pvcsCreated).toHaveLength(0);
     const events: any[] = [];
     await sbx.runAgent(
       "t1",
@@ -151,5 +172,48 @@ describe("KubernetesSandbox", () => {
     await sbx.provision();
     await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
     await expect(sbx.dispose()).resolves.toBeUndefined();
+  });
+});
+
+describe("KubernetesSandbox PVC workspace (pre-clone)", () => {
+  const pre = { owner: "acme", repo: "web", branch: "feature/x", token: "ghs_abc" };
+
+  it("ensures the PVC (created on 404) and returns the repo subdir as agentCwd", async () => {
+    const { apis, pvcsRead, pvcsCreated } = fakeApis();
+    const sbx = new KubernetesSandbox(factoryOpts, { namespace: "ns", image: "img", apis });
+    const result = await sbx.provision(pre as any);
+
+    expect(pvcsRead).toHaveLength(1); // existence check first
+    expect(pvcsCreated).toHaveLength(1); // 404 → create
+    expect(pvcsCreated[0].spec.accessModes).toEqual(["ReadWriteOnce"]);
+    expect(result.hostWorkspaceDir).toBe("/home/agent/workspace");
+    expect(result.agentCwd).toBe("/home/agent/workspace/web");
+  });
+
+  it("reuses an existing PVC without re-creating it", async () => {
+    const { apis, pvcsRead, pvcsCreated } = fakeApis({ pvcExists: true });
+    const sbx = new KubernetesSandbox(factoryOpts, { namespace: "ns", image: "img", apis });
+    await sbx.provision(pre as any);
+
+    expect(pvcsRead).toHaveLength(1);
+    expect(pvcsCreated).toHaveLength(0);
+  });
+
+  it("stages a PVC-backed pod with a clone initContainer sharing the creds Secret", async () => {
+    const { apis, created } = fakeApis();
+    const sbx = new KubernetesSandbox(factoryOpts, { namespace: "ns", image: "img", apis });
+    const result = await sbx.provision(pre as any);
+    await sbx.runCommand("t1", "true", { cwd: result.agentCwd, timeoutSeconds: 30 } as any);
+
+    expect(created).toHaveLength(1);
+    const pod = created[0];
+    const vol = pod.spec.volumes.find((v: any) => v.name === "workspace");
+    expect(vol.persistentVolumeClaim?.claimName).toMatch(/^ws-/);
+    expect(pod.spec.initContainers).toHaveLength(1);
+    expect(pod.spec.initContainers[0].name).toBe("clone");
+    const credsSecretName = pod.spec.containers[0].envFrom[0].secretRef.name;
+    expect(pod.spec.initContainers[0].envFrom).toContainEqual({
+      secretRef: { name: credsSecretName },
+    });
   });
 });

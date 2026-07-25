@@ -1,3 +1,4 @@
+import { ApiException } from "@kubernetes/client-node";
 import type { RunResult } from "agentic-pi";
 import type {
   Sandbox,
@@ -12,12 +13,14 @@ import type {
 import { parseLine } from "../sandbox.js";
 import type { SandboxBackend } from "../../config/config.js";
 import { makeK8sApis, type K8sApis } from "./client.js";
-import { buildPodManifest } from "./pod.js";
+import { buildPodManifest, WORKSPACE_DIR, type PodSpecInput } from "./pod.js";
 import { buildSecretManifest, secretNameFor } from "./secret.js";
 import { podNameFor } from "./naming.js";
 import { streamPodLog } from "./log-stream.js";
+import { buildPvcManifest, pvcNameFor } from "./pvc.js";
+import { buildCloneInitContainer } from "./init-clone.js";
 
-const WORKSPACE_DIR = "/home/agent/workspace";
+type Workspace = PodSpecInput["workspace"];
 
 /** Bound on the post-stream status poll: ~15 × 500ms ≈ 8s before the coarse
  *  phase-based fallback, so a lagging kubelet status never hangs a command. */
@@ -40,17 +43,16 @@ const FATAL_WAITING_REASONS = new Set([
   "CreateContainerError",
 ]);
 
-/** Skeleton config the adapter needs; grows in later plans (namespace/image
- *  stay fixed here — the PVC, skill staging, and stdin/attach wiring land in
- *  Plans 2-3).
+/** Skeleton config the adapter needs; grows in later plans (skill staging and
+ *  stdin/attach wiring land in Plan 3).
  *
  *  `storageClassName` / `workspaceSize` / `runAsUser` are optional for now —
  *  the factory (`sandbox.ts`) already resolves and passes all five fields via
  *  `resolveKubernetesConfig()`. `runAsUser` is consumed as of Task 2 (defaults
- *  to 10001 when unset — a stopgap; see the `runAsUser` field below), but
- *  `storageClassName`/`workspaceSize` stay unused until the PVC (Task 5)
- *  wiring lands. Made required then; kept optional here to avoid a mid-plan
- *  type break. */
+ *  to 10001 when unset — a stopgap). As of Task 5, `storageClassName` /
+ *  `workspaceSize` size the per-(repo,PR) PVC (defaulting to `truenas-iscsi` /
+ *  `5Gi` when unset). Task 6 makes all three required; kept optional here to
+ *  avoid a mid-plan type break. */
 export interface K8sAdapterConfig {
   namespace: string;
   image: string;
@@ -63,12 +65,13 @@ export interface K8sAdapterConfig {
 
 /**
  * The `kubernetes` {@link Sandbox} adapter — one pod per `runAgent`/
- * `runCommand` call. Plan 1 walking skeleton: `provision` hands back a fixed
- * in-pod `emptyDir` workspace path (no PVC yet, so nothing persists between
- * phases), `stageSkills`/`sandboxPathFor` are stubs, and `runAgent` does not
- * yet deliver the prompt to the container (see the comment on `runAgent`
- * below) — Plan 2 adds the PVC and the stdin/attach wiring, Plan 3 adds
- * skill staging.
+ * `runCommand` call. As of Task 5, `provision` ensures a stable per-(repo,PR)
+ * RWO PVC when handed a pre-clone descriptor (design B — the harness can't
+ * pre-clone host-side, so an initContainer clones inside the pod) and falls
+ * back to an ephemeral in-pod `emptyDir` otherwise. `stageSkills` is still a
+ * stub (Plan 3), and `runAgent` does not yet deliver the prompt to the
+ * container (see the comment on `runAgent` below) — ownerReference cleanup
+ * and the prompt Secret land in Task 6.
  */
 export class KubernetesSandbox implements Sandbox {
   readonly backend: SandboxBackend = "kubernetes";
@@ -77,8 +80,14 @@ export class KubernetesSandbox implements Sandbox {
   private readonly image: string;
   // Stopgap default until Task 6 finalizes cluster-wide runAsUser wiring.
   private readonly runAsUser: number;
+  private readonly storageClassName: string;
+  private readonly workspaceSize: string;
   private activePod?: string;
   private activeCredsSecret?: string;
+  /** Pre-clone descriptor from the last `provision()` call, if any — `runPod`
+   *  needs the repo coordinates to build the clone initContainer. */
+  private pre?: PrePopulateSpec;
+  private workspace: Workspace = { kind: "emptyDir" };
 
   constructor(
     private readonly opts: SandboxFactoryOpts,
@@ -88,11 +97,40 @@ export class KubernetesSandbox implements Sandbox {
     this.ns = cfg.namespace;
     this.image = opts.imageName ?? cfg.image;
     this.runAsUser = cfg.runAsUser ?? 10001;
+    this.storageClassName = cfg.storageClassName ?? "truenas-iscsi";
+    this.workspaceSize = cfg.workspaceSize ?? "5Gi";
   }
 
-  async provision(_pre?: PrePopulateSpec): Promise<ProvisionResult> {
-    // Plan 1: emptyDir workspace inside the pod; nothing to pre-clone yet.
-    return { hostWorkspaceDir: WORKSPACE_DIR, agentCwd: WORKSPACE_DIR };
+  async provision(pre?: PrePopulateSpec): Promise<ProvisionResult> {
+    this.pre = pre;
+    if (!pre) {
+      this.workspace = { kind: "emptyDir" };
+      return { hostWorkspaceDir: WORKSPACE_DIR, agentCwd: WORKSPACE_DIR };
+    }
+    const claimName = pvcNameFor(this.opts.taskId);
+    await this.ensurePvc(claimName);
+    this.workspace = { kind: "pvc", claimName };
+    return { hostWorkspaceDir: WORKSPACE_DIR, agentCwd: `${WORKSPACE_DIR}/${pre.repo}` };
+  }
+
+  /** Stable per-(repo,PR) PVC (design B, locked decision #2) — created once and
+   *  reused across runs/phases, never recreated or resized here (Plan 4). */
+  private async ensurePvc(name: string): Promise<void> {
+    try {
+      await this.apis.core.readNamespacedPersistentVolumeClaim({ name, namespace: this.ns });
+      return;
+    } catch (err) {
+      if (!(err instanceof ApiException) || err.code !== 404) throw err;
+    }
+    await this.apis.core.createNamespacedPersistentVolumeClaim({
+      namespace: this.ns,
+      body: buildPvcManifest({
+        name,
+        namespace: this.ns,
+        storageClassName: this.storageClassName,
+        size: this.workspaceSize,
+      }),
+    });
   }
 
   stageSkills(_phaseKey: string, _skillPaths: string[] | undefined): string[] | undefined {
@@ -195,6 +233,23 @@ export class KubernetesSandbox implements Sandbox {
       }),
     });
 
+    // Minimal clone init (locked decision #2) — only when this run has a PVC
+    // workspace AND a pre-clone descriptor (an ephemeral emptyDir run has
+    // nothing to clone into). Cloned coordinates come from `this.pre`, stashed
+    // by the last `provision()` call.
+    const initContainers =
+      this.workspace.kind === "pvc" && this.pre
+        ? [
+            buildCloneInitContainer(this.image, {
+              owner: this.pre.owner,
+              repo: this.pre.repo,
+              branch: this.pre.branch,
+              cwd: WORKSPACE_DIR,
+              runAsUser: this.runAsUser,
+            }),
+          ]
+        : undefined;
+
     // Wall-clock cap: activeDeadlineSeconds kills the pod at the per-call
     // budget (runCommand threads its RunCommandOpts.timeoutSeconds; runAgent
     // falls through to the factory timeout). streamPodLog resolves once the pod
@@ -208,6 +263,8 @@ export class KubernetesSandbox implements Sandbox {
       cwd,
       activeDeadlineSeconds: timeoutSeconds ?? this.opts.timeoutSeconds ?? 1800,
       runAsUser: this.runAsUser,
+      workspace: this.workspace,
+      initContainers,
     });
     await this.apis.core.createNamespacedPod({ namespace: this.ns, body: manifest });
     await this.waitForContainerStart(name);

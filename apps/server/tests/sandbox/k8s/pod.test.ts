@@ -7,7 +7,7 @@ describe("buildPodManifest", () => {
     image: "ghcr.io/nearform/lastlight-sandbox:latest",
     command: ["sh", "-c", "echo hi"], envFromSecret: "ll-x-creds",
     cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800,
-    runAsUser: 10001,
+    runAsUser: 10001, workspace: { kind: "emptyDir" },
   });
   it("targets the sandbox namespace and image", () => {
     expect(pod.metadata?.namespace).toBe("lastlight-sandboxes");
@@ -28,7 +28,7 @@ describe("buildPodManifest securityContext", () => {
     image: "ghcr.io/yo61/lastlight-sandbox:latest",
     command: ["sh", "-c", "echo hi"], envFromSecret: "ll-x-creds",
     cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800,
-    runAsUser: 10001,
+    runAsUser: 10001, workspace: { kind: "emptyDir" },
   });
   it("sets a restricted-compliant pod securityContext", () => {
     expect(pod.spec?.securityContext?.runAsNonRoot).toBe(true);
@@ -47,7 +47,7 @@ describe("buildPodManifest creds via envFrom", () => {
     name: "ll-x", namespace: "lastlight-sandboxes",
     image: "img", command: ["sh", "-c", "true"],
     envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
-    activeDeadlineSeconds: 1800, runAsUser: 10001,
+    activeDeadlineSeconds: 1800, runAsUser: 10001, workspace: { kind: "emptyDir" },
   });
   it("pulls env from the creds Secret, not inline values", () => {
     const c = pod.spec?.containers[0];
@@ -63,6 +63,7 @@ describe("buildPodManifest prompt mount", () => {
       command: ["sh", "-c", "exec agentic-pi run --model m --sandbox none --no-session < " + PROMPT_FILE],
       envFromSecret: "ll-x-creds", promptSecret: "ll-x-prompt",
       cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" },
     });
     const vol = pod.spec?.volumes?.find((v) => v.name === "prompt");
     expect(vol?.secret).toMatchObject({
@@ -78,7 +79,45 @@ describe("buildPodManifest prompt mount", () => {
       name: "ll-x", namespace: "lastlight-sandboxes", image: "img",
       command: ["sh", "-c", "echo hi"], envFromSecret: "ll-x-creds",
       cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" },
     });
     expect(pod.spec?.volumes?.some((v) => v.name === "prompt")).toBe(false);
+  });
+});
+
+describe("buildPodManifest workspace", () => {
+  it("backs the workspace with the PVC and attaches the init clone when kind=pvc", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "pvc", claimName: "ws-acme-web-pr12" },
+      initContainers: [{ name: "clone", image: "img" }],
+    });
+    const vol = pod.spec?.volumes?.find((v) => v.name === "workspace");
+    expect(vol?.persistentVolumeClaim?.claimName).toBe("ws-acme-web-pr12");
+    expect(pod.spec?.initContainers?.[0].name).toBe("clone");
+  });
+  it("uses emptyDir with no init when kind=emptyDir", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" },
+    });
+    const vol = pod.spec?.volumes?.find((v) => v.name === "workspace");
+    expect(vol?.emptyDir).toBeDefined();
+    expect(pod.spec?.initContainers).toBeUndefined();
+  });
+  it("attaches the creds Secret envFrom to the init clone container", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+      activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "pvc", claimName: "ws-acme-web-pr12" },
+      initContainers: [{ name: "clone", image: "img" }],
+    });
+    const init = pod.spec?.initContainers?.[0];
+    expect(init?.envFrom).toContainEqual({ secretRef: { name: "ll-x-creds" } });
   });
 });
