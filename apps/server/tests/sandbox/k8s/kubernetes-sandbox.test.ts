@@ -297,6 +297,70 @@ describe("KubernetesSandbox egress policy", () => {
     await sbx.runCommand("t2", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
     expect(created[0].metadata.labels[EGRESS_POLICY_LABEL]).toBe("open");
   });
+
+  it(
+    "a 403 (RBAC not yet granted) warns once and still runs the pod on default-allow",
+    async () => {
+      const create = vi.fn(async () => {
+        throw new ApiException(403, "Forbidden", {}, {});
+      });
+      const { apis, created } = fakeApis({ createNamespacedCustomObject: create });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const sbx = new KubernetesSandbox(factoryOpts, cfg(apis, { namespace: "ns-403" }));
+        await sbx.provision();
+        await expect(
+          sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any),
+        ).resolves.toMatchObject({ exitCode: 0 });
+        expect(created).toHaveLength(1);
+        expect(created[0].metadata.labels[EGRESS_POLICY_LABEL]).toBe("strict");
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
+  it(
+    "warns only once across two runs in the same namespace (ensure-once cache)",
+    async () => {
+      const create = vi.fn(async () => {
+        throw new ApiException(403, "Forbidden", {}, {});
+      });
+      const { apis } = fakeApis({ createNamespacedCustomObject: create });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const sbx = new KubernetesSandbox(factoryOpts, cfg(apis, { namespace: "ns-warn-once" }));
+        await sbx.provision();
+        await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+        await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
+  it(
+    "a non-403 error fails the run and clears the cache so a later run retries the apply",
+    async () => {
+      const create = vi
+        .fn()
+        .mockRejectedValueOnce(new ApiException(500, "Server Error", {}, {}))
+        .mockResolvedValue({});
+      const { apis } = fakeApis({ createNamespacedCustomObject: create });
+      const sbx = new KubernetesSandbox(factoryOpts, cfg(apis, { namespace: "ns-500" }));
+      await sbx.provision();
+
+      await expect(
+        sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any),
+      ).rejects.toThrow();
+      expect(create).toHaveBeenCalledTimes(1);
+
+      await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+      expect(create.mock.calls.length).toBeGreaterThan(1);
+    },
+  );
 });
 
 describe("KubernetesSandbox PVC workspace (pre-clone)", () => {
