@@ -187,6 +187,34 @@ describe("KubernetesSandbox", () => {
     ).rejects.toThrow(/ImagePullBackOff/);
   });
 
+  it("fails fast with the init container's reason when clone fails (git auth error)", async () => {
+    const { apis } = fakeApis({
+      status: {
+        phase: "Pending",
+        containerStatuses: [{ state: { waiting: { reason: "PodInitializing" } } }],
+        initContainerStatuses: [
+          {
+            name: "clone",
+            state: {
+              terminated: {
+                exitCode: 128,
+                reason: "Error",
+                message: "fatal: could not read Username",
+              },
+            },
+          },
+        ],
+      },
+    });
+    const sbx = new KubernetesSandbox(factoryOpts, cfg(apis));
+    await sbx.provision();
+    await expect(
+      sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any),
+    ).rejects.toThrow(/init container "clone" failed \(exit 128\): Error/);
+    // Fails on the FIRST poll, not after the full ~60s start budget.
+    expect(apis.core.readNamespacedPodStatus).toHaveBeenCalledTimes(1);
+  });
+
   it("dispose swallows a delete failure", async () => {
     const { apis } = fakeApis({ deleteThrows: true });
     const sbx = new KubernetesSandbox(factoryOpts, cfg(apis));

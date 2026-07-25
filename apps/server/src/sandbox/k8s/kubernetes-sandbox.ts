@@ -1,5 +1,5 @@
 import { ApiException } from "@kubernetes/client-node";
-import type { V1Pod } from "@kubernetes/client-node";
+import type { V1ContainerStatus, V1Pod } from "@kubernetes/client-node";
 import type { RunResult } from "agentic-pi";
 import type {
   Sandbox,
@@ -364,11 +364,15 @@ export class KubernetesSandbox implements Sandbox {
    * fast command can finish before the first poll). A terminal image/config
    * error (`ImagePullBackOff`, …) fails fast with its real reason rather than
    * waiting out the budget, so the failure is debuggable instead of a cryptic 400.
+   * A failed clone initContainer is checked on every poll too — otherwise the
+   * main container just sits at `PodInitializing` for the whole budget while
+   * the real `git clone` failure sits unreported in `initContainerStatuses`.
    */
   private async waitForContainerStart(name: string): Promise<void> {
     let lastReason = "";
     for (let attempt = 0; attempt < POD_START_POLL_ATTEMPTS; attempt++) {
       const pod = await this.apis.core.readNamespacedPodStatus({ name, namespace: this.ns });
+      this.checkInitContainerFailure(name, pod.status?.initContainerStatuses);
       const state = pod.status?.containerStatuses?.[0]?.state;
       const phase = pod.status?.phase;
       if (state?.running || state?.terminated || phase === "Succeeded" || phase === "Failed") {
@@ -389,6 +393,36 @@ export class KubernetesSandbox implements Sandbox {
       `k8s sandbox pod ${name} container did not start within ${budgetSeconds}s ` +
         `(last state: ${lastReason || "unknown"})`,
     );
+  }
+
+  /**
+   * Fail fast when the clone initContainer has failed or is stuck on a fatal
+   * pull/config error, instead of leaving the caller to wait out the full
+   * `waitForContainerStart` budget while the main container reports the
+   * uninformative `PodInitializing` (which is the NORMAL state while an
+   * initContainer is still running — not itself a failure).
+   */
+  private checkInitContainerFailure(
+    podName: string,
+    initStatuses: V1ContainerStatus[] | undefined,
+  ): void {
+    for (const init of initStatuses ?? []) {
+      const terminated = init.state?.terminated;
+      if (terminated && terminated.exitCode !== 0) {
+        throw new Error(
+          `k8s sandbox pod ${podName} init container "${init.name}" failed ` +
+            `(exit ${terminated.exitCode}): ${terminated.reason ?? "unknown"}` +
+            (terminated.message ? ` — ${terminated.message}` : ""),
+        );
+      }
+      const waiting = init.state?.waiting;
+      if (waiting?.reason && FATAL_WAITING_REASONS.has(waiting.reason)) {
+        throw new Error(
+          `k8s sandbox pod ${podName} init container "${init.name}" cannot start: ` +
+            `${waiting.reason}` + (waiting.message ? ` — ${waiting.message}` : ""),
+        );
+      }
+    }
   }
 
   async dispose(): Promise<void> {
