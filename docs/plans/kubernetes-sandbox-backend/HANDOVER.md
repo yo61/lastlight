@@ -1,6 +1,6 @@
 # Handover — Kubernetes sandbox backend
 
-**Last updated:** 2026-07-25 · **Status:** Plan 2 complete + final-reviewed (opus). Not yet cluster-run on Plan-2 paths.
+**Last updated:** 2026-07-25 · **Status:** Plan 2 complete + final-reviewed (opus) + **VALIDATED end-to-end on the real cluster** (all 3 integration tests green).
 
 ## TL;DR
 
@@ -10,9 +10,9 @@ contribution. It runs each workflow phase as its own Pod (create → wait-for-st
 → stream JSONL → reap) behind the existing `Sandbox` port, instead of the
 in-process QEMU (`gondolin`) backend.
 
-- **Plan 1 (walking skeleton) DONE + cluster-validated. Plan 2 (creds + workspace + prompt) DONE + final-reviewed.**
-- Branch: **`feat/k8s-sandbox-backend`** — Plan-2 range `0dc9b9d..4ced0ac` (9 commits), **local-only (NOT pushed)**.
-- Next: **Plan 3** (egress `CiliumNetworkPolicy` from `egress-allowlist.ts` + HTTP skill-bundle fetch + `toEndpoints`).
+- **Plan 1 DONE + cluster-validated. Plan 2 (creds + workspace + prompt) DONE + final-reviewed + cluster-validated end-to-end.**
+- Branch: **`feat/k8s-sandbox-backend`** — Plan-2 range `0dc9b9d..03d871d` (14 commits), **pushed to the fork** (`origin`).
+- Next: **Plan 3** (egress `CiliumNetworkPolicy` from `egress-allowlist.ts` + HTTP skill-bundle fetch + `toEndpoints`). NOT started.
 - Plan-2 doc: `plan-2-creds-workspace.md`. SDD ledger: `.superpowers/sdd/progress.md` (per-task reviews, the security fix, the I1 fix, all tracked follow-ups).
 
 ## Plan 2 — what landed + open follow-ups (tracked, deliberately deferred)
@@ -22,7 +22,10 @@ Per-run creds Secret (`envFrom`, inline-env removed) + prompt Secret (mounted fi
 - **RunAgentOpts parity:** k8s `runAgent` currently drops `thinking`/`variant` (silent default reasoning), `profile`, `webSearch`, `skillDirs`. `skillDirs`/`webSearch` are Plan 3; `thinking`/`profile` are a fast-follow.
 - **RWO Multi-Attach edge** (fast next-phase pod on a different node): Plan 4 lifecycle.
 - **Sandbox image: BUILT + public.** `ghcr.io/yo61/lastlight-sandbox:latest` is built (native amd64/linux, `sha256:8b774295…`) and the ghcr package is **public** (cluster pulls anonymously — no imagePullSecret needed). Built by a **fork-only** GitHub Actions workflow `.github/workflows/sandbox-image-yo61.yml` (SHA-pinned, on the fork's `main`; NOT upstreamed). Rebuild after sandbox-source changes: `gh workflow run sandbox-image-yo61.yml --repo yo61/lastlight -f tag=latest` (the `--repo` is required — `gh` defaults to the `nearform` upstream). A local cross-arch build on Apple Silicon does NOT work (QEMU segfaults installing `uv`) — always use the workflow / a native amd64 host.
-- **Cluster run of Plan-2 paths NOT yet done.** Validate: `RUN_K8S_IT=1 K8S_SANDBOX_IMAGE=ghcr.io/yo61/lastlight-sandbox:latest ANTHROPIC_API_KEY=… GITHUB_TOKEN=… pnpm --filter lastlight-core exec vitest run tests/sandbox/k8s/kubernetes.integration.test.ts`.
+- **Cluster run: VALIDATED — all 3 integration tests green** (Plan 1 bash; Plan 2 clone-into-PVC; Plan 2 AI phase, prompt via mounted Secret → anthropic → agent_end). Re-validate: `RUN_K8S_IT=1 K8S_SANDBOX_IMAGE=ghcr.io/yo61/lastlight-sandbox:latest ANTHROPIC_API_KEY=… GITHUB_TOKEN=… pnpm --filter lastlight-core exec vitest run tests/sandbox/k8s/kubernetes.integration.test.ts`.
+- **3 cluster-surfaced fixes** (regression-tested): test pod-name collision (unique per-case taskId); init-log-fetch (a failed init container's logs now append to the thrown error); **fsGroup** (truenas-iscsi PVC mounts root-owned → non-root uid 10001 couldn't write; `fsGroup=runAsUser` fixes it — CSIDriver `tns.csi.io` is `fsGroupPolicy: File`, so it's honored).
+- **Egress caveat for Plan 3:** the AI test passed because egress is currently OPEN (no CiliumNetworkPolicy; Cilium default-allow). Plan 3's allowlist MUST include the provider hosts (anthropic) + github + package registries or these validated flows break under the policy.
+- **Plan 4 note:** `fsGroup` triggers a recursive volume chown on pod start — slow on a large REUSED PVC; set `fsGroupChangePolicy: OnRootMismatch` when PVC reuse lands.
 - **Docs-sync gate** still deferred: backend stays unreachable until Plan 5 Flux manifests, so mid-build commits keep bypassing docs-check (`LASTLIGHT_SKIP_DOCS_CHECK=1`); run the `docs-sync` skill only when the whole backend is reachable, before merge.
 
 ## Resume the AI session (paste to a fresh Claude)
