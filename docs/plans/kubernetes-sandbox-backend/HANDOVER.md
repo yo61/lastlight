@@ -1,6 +1,6 @@
 # Handover — Kubernetes sandbox backend
 
-**Last updated:** 2026-07-25 · **Status:** Plan 2 complete + final-reviewed (opus) + **VALIDATED end-to-end on the real cluster** (all 3 integration tests green).
+**Last updated:** 2026-07-25 · **Status:** Plan 3 (egress) complete + final-reviewed (opus, clean). Plan 2 remains VALIDATED end-to-end on the real cluster. Plan 3 enforcement validation is pending Plan 6 RBAC (the IT skips gracefully until then).
 
 ## TL;DR
 
@@ -10,32 +10,44 @@ contribution. It runs each workflow phase as its own Pod (create → wait-for-st
 → stream JSONL → reap) behind the existing `Sandbox` port, instead of the
 in-process QEMU (`gondolin`) backend.
 
-- **Plan 1 DONE + cluster-validated. Plan 2 (creds + workspace + prompt) DONE + final-reviewed + cluster-validated end-to-end.**
-- Branch: **`feat/k8s-sandbox-backend`** — Plan-2 range `0dc9b9d..03d871d` (14 commits), **pushed to the fork** (`origin`).
-- Next: **Plan 3** (egress `CiliumNetworkPolicy` from `egress-allowlist.ts` + HTTP skill-bundle fetch + `toEndpoints`). NOT started.
-- Plan-2 doc: `plan-2-creds-workspace.md`. SDD ledger: `.superpowers/sdd/progress.md` (per-task reviews, the security fix, the I1 fix, all tracked follow-ups).
+- **Plan 1 + Plan 2 DONE + cluster-validated. Plan 3 (egress) DONE + final-reviewed (opus, clean).**
+- Branch: **`feat/k8s-sandbox-backend`** — Plan-2 range `0dc9b9d..03d871d`; **Plan-3 range `02a912a..49e72fd`** (10 commits, incl. the plan doc). Plan 2 was pushed to the fork; **Plan 3 is local-only** — push with `git push origin feat/k8s-sandbox-backend`.
+- **Roadmap was SPLIT** (Robin's call, Clifton approved the direction): the old "Plan 3 = egress + skills" became two plans, so the roadmap is now **6 plans**: 1 skeleton, 2 creds, **3 egress (DONE)**, **4 skills**, 5 lifecycle, 6 Flux. Every "Plan 4 (lifecycle)" / "Plan 5 (Flux)" reference below that predates this split now means Plan 5 / Plan 6.
+- Next: **Plan 4 — skills** (HTTP skill-bundle endpoint on the harness + initContainer fetch into a shared emptyDir + the Cilium `toEndpoints` sandbox→harness rule; carries `skillDirs`, and `webSearch`). Design §7 + §4's harness-channel bullet.
+- Plan docs: `plan-2-creds-workspace.md`, `plan-3-egress.md`. SDD ledgers are now **per-plan**: `.superpowers/sdd/plan-3-egress/progress.md` (Plan 3 — per-task reviews, 2 fix-loop items, the final-review fix wave, 5 parked minors). Plan 2's is the old flat `.superpowers/sdd/progress.md`.
 
 ## Plan 2 — what landed + open follow-ups (tracked, deliberately deferred)
 
 Per-run creds Secret (`envFrom`, inline-env removed) + prompt Secret (mounted file → `agentic-pi` stdin), both ownerRef-patched for cascade-GC; per-`(repo,PR)` RWO PVC + **minimal**-clone initContainer (#107 reuse/refresh/merge-base → Plan 4); PodSecurity-`restricted` securityContext; `sandbox.kubernetes.*` config + registry-qualified **yo61** image. #223 killed by construction. A commit-review HIGH command injection (attacker-named PR branch → `sh -c`) was found + fixed (argv, not shell text). Final opus review: ready to merge, no Critical; I1 (opaque clone-init failure) fixed.
 
-- **RunAgentOpts parity:** k8s `runAgent` currently drops `thinking`/`variant` (silent default reasoning), `profile`, `webSearch`, `skillDirs`. `skillDirs`/`webSearch` are Plan 3; `thinking`/`profile` are a fast-follow.
-- **RWO Multi-Attach edge** (fast next-phase pod on a different node): Plan 4 lifecycle.
+- **RunAgentOpts parity:** k8s `runAgent` currently drops `thinking`/`variant` (silent default reasoning), `profile`, `webSearch`, `skillDirs`. `skillDirs`/`webSearch` are **Plan 4 (skills)**; `thinking`/`profile` are a fast-follow.
+- **RWO Multi-Attach edge** (fast next-phase pod on a different node): **Plan 5 (lifecycle)**.
 - **Sandbox image: BUILT + public.** `ghcr.io/yo61/lastlight-sandbox:latest` is built (native amd64/linux, `sha256:8b774295…`) and the ghcr package is **public** (cluster pulls anonymously — no imagePullSecret needed). Built by a **fork-only** GitHub Actions workflow `.github/workflows/sandbox-image-yo61.yml` (SHA-pinned, on the fork's `main`; NOT upstreamed). Rebuild after sandbox-source changes: `gh workflow run sandbox-image-yo61.yml --repo yo61/lastlight -f tag=latest` (the `--repo` is required — `gh` defaults to the `nearform` upstream). A local cross-arch build on Apple Silicon does NOT work (QEMU segfaults installing `uv`) — always use the workflow / a native amd64 host.
 - **Cluster run: VALIDATED — all 3 integration tests green** (Plan 1 bash; Plan 2 clone-into-PVC; Plan 2 AI phase, prompt via mounted Secret → anthropic → agent_end). Re-validate: `RUN_K8S_IT=1 K8S_SANDBOX_IMAGE=ghcr.io/yo61/lastlight-sandbox:latest ANTHROPIC_API_KEY=… GITHUB_TOKEN=… pnpm --filter lastlight-core exec vitest run tests/sandbox/k8s/kubernetes.integration.test.ts`.
 - **3 cluster-surfaced fixes** (regression-tested): test pod-name collision (unique per-case taskId); init-log-fetch (a failed init container's logs now append to the thrown error); **fsGroup** (truenas-iscsi PVC mounts root-owned → non-root uid 10001 couldn't write; `fsGroup=runAsUser` fixes it — CSIDriver `tns.csi.io` is `fsGroupPolicy: File`, so it's honored).
-- **Egress caveat for Plan 3:** the AI test passed because egress is currently OPEN (no CiliumNetworkPolicy; Cilium default-allow). Plan 3's allowlist MUST include the provider hosts (anthropic) + github + package registries or these validated flows break under the policy.
-- **Plan 4 note:** `fsGroup` triggers a recursive volume chown on pod start — slow on a large REUSED PVC; set `fsGroupChangePolicy: OnRootMismatch` when PVC reuse lands.
-- **Docs-sync gate** still deferred: backend stays unreachable until Plan 5 Flux manifests, so mid-build commits keep bypassing docs-check (`LASTLIGHT_SKIP_DOCS_CHECK=1`); run the `docs-sync` skill only when the whole backend is reachable, before merge.
+- **Egress caveat (now handled by Plan 3):** the Plan-2 AI test passed on OPEN egress (Cilium default-allow). Plan 3's strict allowlist is rendered from `egress-allowlist.ts` (`DEFAULT_ALLOWLIST` = GitHub + provider/anthropic + package registries), so the validated clone/AI flows keep working under the policy. Confirmed by construction; enforcement re-validation on-cluster is pending Plan 6 RBAC.
+- **Plan 5 (lifecycle) note:** `fsGroup` triggers a recursive volume chown on pod start — slow on a large REUSED PVC; set `fsGroupChangePolicy: OnRootMismatch` when PVC reuse lands.
+- **Docs-sync gate** still deferred: backend stays unreachable until **Plan 6 Flux manifests**, so mid-build commits keep bypassing docs-check (`LASTLIGHT_SKIP_DOCS_CHECK=1`); run the `docs-sync` skill only when the whole backend is reachable, before merge.
+
+## Plan 3 — what landed + open follow-ups (egress; final review clean)
+
+Scope was **egress only** (skills split out to Plan 4). A strict/open **`CiliumNetworkPolicy`** pair is rendered from the shared `egress-allowlist.ts` (`k8s/egress-policy.ts`, golden-tested) and applied idempotently once per namespace via a new `CustomObjectsApi` client (`k8s/egress-apply.ts`, create-or-`409`→replace). Each sandbox Pod is stamped `egress-policy: strict|open` (from `this.opts.egress.unrestricted`) — the label the policy's `endpointSelector` matches. **Strict** = a DNS-proxy rule (port 53 → kube-dns with `rules.dns:[{matchPattern:"*"}]`, *load-bearing* — without it `toFQDNs` never resolves) + the allowlist `toFQDNs` on 443/TCP, default-deny else. **Open** = DNS + broad 80/443 minus a private/link-local/loopback SSRF-floor except-list. Opus final review: **clean, no Critical, no security holes** (strict is FQDN-only, the label is unforgeable since pods have no SA token, the ensure-once cache is concurrency- and retry-correct).
+
+- **Enforcement is best-effort until Plan 6.** Applying the CNP needs the `cilium.io/CiliumNetworkPolicy` RBAC verb, which lands with the Flux `Role` in **Plan 6**. Until then `ensureEgress` catches the `403`, logs **one** warning per namespace, and the run proceeds on Cilium default-allow — **no regression** to the validated flows. The identical code enforces the moment RBAC exists. (A non-403 clears the cache + propagates so a later run retries; both branches are unit-tested.)
+- **The `toEndpoints` sandbox→harness rule is NOT here** — it ships with its only consumer (the skill fetch) in **Plan 4**, extending the same renderer.
+- **Enforcement IT is opt-in + skips gracefully.** A new `RUN_K8S_IT` case curls an allowlisted host (expect 200) and a non-allowlisted host (expect blocked); if the strict CNP wasn't applied (403, no RBAC yet) it `console.warn`s and asserts only the allowlisted side. **Robin: full block-assertion validates only after Plan 6 RBAC lands.**
+- **5 parked minors** (final review, all safe-to-defer — see `.superpowers/sdd/plan-3-egress/progress.md`): `strictPolicyPresent` blanket `catch` (log the error); DNS `matchPattern:"*"` leaves a DNS-tunnel channel (same exposure as docker; tracked); the open except-list is cluster-scoped (add a comment naming the pod/service-CIDR dependency if reused elsewhere); the `resourceVersion` double-cast is stylistic; **`strictHosts()` duplicates `egressPolicyFor`'s merge — a Plan 6 egress-consolidation candidate (#134)**.
 
 ## Resume the AI session (paste to a fresh Claude)
 
 > Resume the k8s sandbox backend work. Read, in this repo:
-> `docs/plans/kubernetes-sandbox-backend/HANDOVER.md`, `design.md`,
-> `plan-1-walking-skeleton.md`, and `.superpowers/sdd/progress.md`. Plan 1 is
-> complete and cluster-validated. Write **Plan 2** with the `superpowers:writing-plans`
-> skill (scope in the handover), then execute it with
-> `superpowers:subagent-driven-development`, same as Plan 1. We're on branch
+> `docs/plans/kubernetes-sandbox-backend/HANDOVER.md`, `design.md` (esp. §7 skills
+> + §4 harness-channel), and `.superpowers/sdd/plan-3-egress/progress.md`. Plans 1–3
+> are complete (3 = egress, final-reviewed clean); the roadmap was split so **skills
+> is now Plan 4**. Write **Plan 4 (skills)** with the `superpowers:writing-plans`
+> skill (HTTP skill-bundle endpoint + initContainer fetch + the Cilium `toEndpoints`
+> sandbox→harness rule, extending `k8s/egress-policy.ts`), then execute it with
+> `superpowers:subagent-driven-development`, same as Plans 1–3. We're on branch
 > `feat/k8s-sandbox-backend`.
 
 ## Key files
@@ -43,9 +55,10 @@ Per-run creds Secret (`envFrom`, inline-env removed) + prompt Secret (mounted fi
 | File | What |
 |---|---|
 | `docs/plans/kubernetes-sandbox-backend/design.md` | Approved design (8 decisions, security posture, Flux manifests). |
-| `docs/plans/kubernetes-sandbox-backend/plan-1-walking-skeleton.md` | Plan 1 (executed) + the 5-plan roadmap table. |
-| `.superpowers/sdd/progress.md` | SDD ledger — every task, all review findings, the 3 cluster fixes, Plan-2 deferrals. Survives compaction; trust it + `git log`. |
-| `apps/server/src/sandbox/k8s/` | The code: `client.ts`, `naming.ts`, `pod.ts`, `log-stream.ts`, `kubernetes-sandbox.ts`. |
+| `docs/plans/kubernetes-sandbox-backend/plan-1-walking-skeleton.md` | Plan 1 (executed) + the roadmap table (originally 5 plans; now 6 after the egress/skills split). |
+| `docs/plans/kubernetes-sandbox-backend/plan-3-egress.md` | Plan 3 (executed) — the egress plan. |
+| `.superpowers/sdd/plan-3-egress/progress.md` | Plan 3 SDD ledger (per-plan path now). Plan 2's is the old flat `.superpowers/sdd/progress.md`. Survives compaction; trust it + `git log`. |
+| `apps/server/src/sandbox/k8s/` | The code: `client.ts`, `naming.ts`, `pod.ts`, `log-stream.ts`, `kubernetes-sandbox.ts`, `secret.ts`, `pvc.ts`, `init-clone.ts`, **`egress-policy.ts`, `egress-apply.ts`** (Plan 3). |
 | `apps/server/src/sandbox/sandbox.ts` | The `sandboxFor` factory wiring + exported `parseLine`. |
 | `apps/server/tests/sandbox/k8s/` | Unit tests + the opt-in integration test. |
 
@@ -93,7 +106,7 @@ pnpm --filter agentic-pi build`). Unit tests (no cluster):
 - kubeconfig context `admin@homelab`, API server `https://192.168.20.9:6443`.
 - **Storage: `truenas-iscsi` (democratic-csi) — RWO only, no RWX.** This is why the
   workspace design is per-`(repo,PR)` RWO PVC (design B), not a shared volume.
-- **CNI: Cilium** (`toFQDNs` egress lands in Plan 3). **ESO** for external secrets.
+- **CNI: Cilium** (`toFQDNs` egress landed in Plan 3 — `CiliumNetworkPolicy` strict/open; enforcement needs the Plan 6 RBAC verb). **ESO** for external secrets.
   **generic-device-plugin** advertises `devic.es/kvm` (irrelevant to this backend —
   no KVM needed).
 - **Namespace `lastlight-sandboxes` enforces PodSecurity `restricted`** — currently
