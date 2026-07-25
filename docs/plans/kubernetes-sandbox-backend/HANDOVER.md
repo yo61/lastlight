@@ -1,6 +1,6 @@
 # Handover — Kubernetes sandbox backend
 
-**Last updated:** 2026-07-24 · **Status:** Plan 1 complete + validated on the real cluster.
+**Last updated:** 2026-07-25 · **Status:** Plan 2 complete + final-reviewed (opus). Not yet cluster-run on Plan-2 paths.
 
 ## TL;DR
 
@@ -10,9 +10,19 @@ contribution. It runs each workflow phase as its own Pod (create → wait-for-st
 → stream JSONL → reap) behind the existing `Sandbox` port, instead of the
 in-process QEMU (`gondolin`) backend.
 
-- **Plan 1 (walking skeleton) is DONE and GREEN on the real cluster.**
-- Branch: **`feat/k8s-sandbox-backend`** — 13 commits, **local-only (NOT pushed)**.
-- Next: **Plan 2** (creds Secret + PVC + prompt delivery + securityContext + yo61 image).
+- **Plan 1 (walking skeleton) DONE + cluster-validated. Plan 2 (creds + workspace + prompt) DONE + final-reviewed.**
+- Branch: **`feat/k8s-sandbox-backend`** — Plan-2 range `0dc9b9d..4ced0ac` (9 commits), **local-only (NOT pushed)**.
+- Next: **Plan 3** (egress `CiliumNetworkPolicy` from `egress-allowlist.ts` + HTTP skill-bundle fetch + `toEndpoints`).
+- Plan-2 doc: `plan-2-creds-workspace.md`. SDD ledger: `.superpowers/sdd/progress.md` (per-task reviews, the security fix, the I1 fix, all tracked follow-ups).
+
+## Plan 2 — what landed + open follow-ups (tracked, deliberately deferred)
+
+Per-run creds Secret (`envFrom`, inline-env removed) + prompt Secret (mounted file → `agentic-pi` stdin), both ownerRef-patched for cascade-GC; per-`(repo,PR)` RWO PVC + **minimal**-clone initContainer (#107 reuse/refresh/merge-base → Plan 4); PodSecurity-`restricted` securityContext; `sandbox.kubernetes.*` config + registry-qualified **yo61** image. #223 killed by construction. A commit-review HIGH command injection (attacker-named PR branch → `sh -c`) was found + fixed (argv, not shell text). Final opus review: ready to merge, no Critical; I1 (opaque clone-init failure) fixed.
+
+- **RunAgentOpts parity:** k8s `runAgent` currently drops `thinking`/`variant` (silent default reasoning), `profile`, `webSearch`, `skillDirs`. `skillDirs`/`webSearch` are Plan 3; `thinking`/`profile` are a fast-follow.
+- **RWO Multi-Attach edge** (fast next-phase pod on a different node): Plan 4 lifecycle.
+- **Cluster run of Plan-2 paths NOT yet done** — needs the `ghcr.io/yo61/lastlight-sandbox` image pullable by the cluster (git+node+agentic-pi). Validate: `RUN_K8S_IT=1 K8S_SANDBOX_IMAGE=ghcr.io/yo61/lastlight-sandbox:latest ANTHROPIC_API_KEY=… GITHUB_TOKEN=… pnpm --filter lastlight-core exec vitest run tests/sandbox/k8s/kubernetes.integration.test.ts`.
+- **Docs-sync gate** still deferred: backend stays unreachable until Plan 5 Flux manifests, so mid-build commits keep bypassing docs-check (`LASTLIGHT_SKIP_DOCS_CHECK=1`); run the `docs-sync` skill only when the whole backend is reachable, before merge.
 
 ## Resume the AI session (paste to a fresh Claude)
 
