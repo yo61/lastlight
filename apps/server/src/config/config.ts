@@ -908,9 +908,13 @@ export function resolveKubernetesConfig(): KubernetesConfig {
       process.env.LASTLIGHT_K8S_WORKSPACE_SIZE ?? k.workspaceSize ?? K8S_DEFAULTS.workspaceSize,
     runAsUser: Number.isFinite(runAsUserEnv) ? runAsUserEnv : (k.runAsUser ?? K8S_DEFAULTS.runAsUser),
     harnessEndpoint:
-      process.env.LASTLIGHT_K8S_HARNESS_ENDPOINT ?? k.harnessEndpoint ?? K8S_DEFAULTS.harnessEndpoint,
+      process.env.LASTLIGHT_K8S_HARNESS_ENDPOINT ??
+      k.harnessEndpoint ??
+      K8S_DEFAULTS.harnessEndpoint,
     harnessNamespace:
-      process.env.LASTLIGHT_K8S_HARNESS_NAMESPACE ?? k.harnessNamespace ?? K8S_DEFAULTS.harnessNamespace,
+      process.env.LASTLIGHT_K8S_HARNESS_NAMESPACE ??
+      k.harnessNamespace ??
+      K8S_DEFAULTS.harnessNamespace,
     harnessPodLabels:
       parseLabels(process.env.LASTLIGHT_K8S_HARNESS_POD_LABELS) ??
       k.harnessPodLabels ??
