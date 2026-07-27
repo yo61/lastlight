@@ -11,6 +11,8 @@ import {
   EGRESS_POLICY_LABEL,
 } from "#src/sandbox/k8s/egress-policy.js";
 import { SkillBundleRegistry } from "#src/sandbox/k8s/skill-bundle.js";
+import { createArtifactStore } from "#src/sandbox/artifact-store.js";
+import { LocalArtifactBackend } from "#src/sandbox/artifact-backend.js";
 
 interface FakeOpts {
   /** The `V1Pod.status` object `readNamespacedPodStatus` returns. */
@@ -608,9 +610,11 @@ describe("KubernetesSandbox (creds + workspace + prompt)", () => {
       });
       const command: string[] = pod.spec.containers[0].command;
       expect(command.join(" ")).toContain("< /lastlight/prompt");
-      // Model is its own trailing argv element, bound to `$1` at exec time —
-      // NOT interpolated into the script string (command[2]).
-      expect(command.at(-1)).toBe("anthropic/claude-sonnet-4-6");
+      // Model and the harness endpoint are their own trailing argv elements,
+      // bound to `$1`/`$2` at exec time — NOT interpolated into the script
+      // string (command[2]).
+      expect(command.at(-2)).toBe("anthropic/claude-sonnet-4-6");
+      expect(command.at(-1)).toBe("http://lastlight.lastlight.svc.cluster.local:8644");
       expect(command[2]).not.toContain("claude-sonnet-4-6");
 
       // ownerRefs patched (both secrets), each as a JSON-Patch "add" op.
@@ -768,5 +772,65 @@ describe("KubernetesSandbox skills staging", () => {
     const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
     expect(creds.stringData.LASTLIGHT_SKILL_TOKEN).toBeUndefined();
     expect(pod.spec.containers[0].command.join(" ")).not.toContain("--skill");
+  });
+});
+
+describe("KubernetesSandbox artifact upload", () => {
+  it(
+    "runAgent mints an artifact token, injects it into creds, and appends a " +
+      "best-effort tar+curl upload that runs after the agent, evicted on dispose",
+    async () => {
+      const { apis, created, secretsCreated } = fakeApis();
+      const artifactStore = createArtifactStore(
+        new LocalArtifactBackend(() => "/tmp/artifact-test"),
+      );
+      const sbx = new KubernetesSandbox(
+        factoryOpts,
+        cfg(apis, { namespace: "ns-artifacts", artifactStore }),
+      );
+      await sbx.provision();
+
+      await sbx.runAgent(
+        "t1",
+        "hello",
+        { model: "anthropic/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace" } as any,
+        () => {},
+      );
+
+      const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
+      const token = creds.stringData.LASTLIGHT_ARTIFACT_TOKEN;
+      expect(token).toBeTruthy();
+      expect(artifactStore.resolve(token)).toBe("t1");
+
+      // Script no longer starts with a bare `exec` — a post-run upload step
+      // must run after the agent, so the agent's own exit code ($?) can be
+      // captured, then restored via the final `exit $rc`.
+      const script: string = created[0].spec.containers[0].command[2];
+      expect(script.trim().startsWith("exec ")).toBe(false);
+      expect(script).toContain("rc=$?");
+      expect(script).toContain("tar -czf - .lastlight");
+      expect(script).toContain("curl -sf -X POST");
+      expect(script).toContain("Authorization: Bearer $LASTLIGHT_ARTIFACT_TOKEN");
+      expect(script).toContain("$2/internal/sandbox-artifacts");
+      expect(script).toContain("|| true");
+      expect(script).toContain("exit $rc");
+
+      await sbx.dispose();
+      expect(artifactStore.resolve(token)).toBeUndefined();
+    },
+  );
+
+  it("runCommand mints no artifact token: no LASTLIGHT_ARTIFACT_TOKEN in creds", async () => {
+    const { apis, secretsCreated } = fakeApis();
+    const artifactStore = createArtifactStore(new LocalArtifactBackend(() => "/tmp/artifact-test"));
+    const sbx = new KubernetesSandbox(
+      factoryOpts,
+      cfg(apis, { namespace: "ns-artifacts-cmd", artifactStore }),
+    );
+    await sbx.provision();
+    await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+
+    const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
+    expect(creds.stringData.LASTLIGHT_ARTIFACT_TOKEN).toBeUndefined();
   });
 });
