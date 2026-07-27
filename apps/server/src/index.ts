@@ -634,8 +634,9 @@ async function main() {
         : onRunStart,
     };
 
+    let result: Awaited<ReturnType<typeof runSimpleWorkflow>> | undefined;
     try {
-      const result = await runSimpleWorkflow(
+      result = await runSimpleWorkflow(
         workflowName,
         request,
         {
@@ -674,12 +675,16 @@ async function main() {
       return { success: false, error: msg };
     } finally {
       // Event-driven admission: after each dispatch settles, pull the next
-      // queued run into a free slot (if any). Fire-and-forget — a slow
-      // admission must not stall the caller.
-      admissionController?.admitNext().catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[admission] admitNext error: ${msg}`);
-      });
+      // queued run into a free slot. Skip it when THIS dispatch just requeued
+      // on quota backpressure — re-promoting instantly would re-hit the full
+      // quota in a tight loop; the periodic sweep + real completions pace the
+      // retry.
+      if (!result?.backpressure) {
+        admissionController?.admitNext().catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[admission] admitNext error: ${msg}`);
+        });
+      }
     }
   };
 
@@ -848,6 +853,7 @@ async function main() {
     resumeOpts,
     maxWorkflows: config.concurrency.maxWorkflows,
     maxQueueWaitMs: config.concurrency.maxQueueWaitMs,
+    backpressureMode: config.sandbox === "kubernetes",
   });
 
   // Mount admin dashboard on the shared HTTP server (always available).
