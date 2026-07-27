@@ -26,6 +26,13 @@ import type { StateDb } from "../state/db.js";
 import type { WorkflowRun } from "../state/workflow-run-store.js";
 import { resumeSimpleRun, type ResumeOptions } from "./resume.js";
 
+/**
+ * Absurdly-high runaway-loop backstop for the k8s backend. NOT a tuned
+ * concurrency limit — the namespace ResourceQuota is the real authority
+ * (design.md §8). Mirrors the workflow engine's 1000-agent cap: a fuse, not a knob.
+ */
+export const K8S_SANITY_FUSE = 1000;
+
 export interface AdmissionDeps {
   db: StateDb;
   resumeOpts: ResumeOptions;
