@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { ApiException } from "@kubernetes/client-node";
 import type { V1PersistentVolumeClaim } from "@kubernetes/client-node";
 import { KubernetesSandbox } from "#src/sandbox/k8s/kubernetes-sandbox.js";
+import { QuotaExceededError } from "#src/sandbox/k8s/quota.js";
 import { makeK8sApis, type K8sApis } from "#src/sandbox/k8s/client.js";
 import { reclaimSandbox } from "#src/sandbox/k8s/reclaim.js";
 import { pvcNameFor } from "#src/sandbox/k8s/pvc.js";
@@ -453,6 +454,120 @@ describe.runIf(RUN)("KubernetesSandbox Plan 5 reclaim (integration)", () => {
         await Promise.race([bg, new Promise((resolve) => setTimeout(resolve, 20_000))]);
         // Now idle — a follow-up sweep removes it so the case doesn't leak.
         await reclaimSandbox(apis, NAMESPACE, { kind: "sweep", staleByHours: 0, maxIdlePVCs: 0 });
+      }
+    },
+    180_000,
+  );
+});
+
+describe.runIf(RUN)("KubernetesSandbox Plan 6 quota-backpressure (integration)", () => {
+  const NAMESPACE = process.env.LASTLIGHT_K8S_NAMESPACE ?? "lastlight-sandboxes";
+  const QUOTA_NAME = "it-sandbox-quota";
+
+  const mkSbx = (taskId: string) =>
+    new KubernetesSandbox(
+      {
+        taskId,
+        egress: { unrestricted: false, hosts: [] },
+        env: {},
+        stateDir: "/tmp",
+        timeoutSeconds: 120,
+      } as any,
+      {
+        namespace: NAMESPACE,
+        image: IMAGE,
+        storageClassName: process.env.LASTLIGHT_K8S_STORAGE_CLASS ??
+          "truenas-iscsi",
+        workspaceSize: "2Gi",
+        runAsUser: parseInt(
+          process.env.LASTLIGHT_K8S_RUN_AS_USER ?? "10001",
+          10,
+        ),
+        harnessEndpoint: HARNESS_ENDPOINT,
+        harnessNamespace: HARNESS_NAMESPACE,
+        harnessPodLabels: HARNESS_POD_LABELS,
+      },
+    );
+
+  it(
+    "requeues a second run under a pods=1 ResourceQuota (403 -> QuotaExceededError), " +
+      "then it succeeds once the first pod's slot frees",
+    async () => {
+      // Requires the ADMIN kubeconfig (admin@homelab): the harness ServiceAccount
+      // can't create/delete a ResourceQuota until Plan 7's Flux `Role` grants that
+      // RBAC verb, so this IT stages the quota itself via admin creds — the same
+      // admin-staging pattern Plan 3 used to validate the CiliumNetworkPolicy
+      // before its RBAC landed (HANDOVER.md).
+      const apis = makeK8sApis();
+      // Unique per run, same collision reasoning as the Plan 2/3/5 cases.
+      const taskA = `it-quota-a-${Date.now()}`;
+      const taskB = `it-quota-b-${Date.now()}`;
+      const sbxA = mkSbx(taskA);
+      const sbxB = mkSbx(taskB);
+
+      await apis.core.createNamespacedResourceQuota({
+        namespace: NAMESPACE,
+        body: {
+          metadata: { name: QUOTA_NAME },
+          spec: { hard: { pods: "1" } },
+        },
+      });
+
+      try {
+        await sbxA.provision();
+        // Fire-and-forget, same reasoning as the Plan 5 sweep-skip case:
+        // runCommand blocks until the pod finishes, so the only way to hold
+        // the quota's single pod slot for B's create attempt is to NOT await
+        // this call. `dispose()` below deletes the pod out from under it,
+        // which makes its log-stream/status-poll reject — expected, not a
+        // failure, so swallow it here and await the settled promise after.
+        const bgA = sbxA
+          .runCommand(taskA, "sleep 60", {
+            cwd: "/home/agent/workspace",
+            timeoutSeconds: 90,
+          })
+          .catch(() => undefined);
+
+        await waitForPodLive(apis, NAMESPACE, podNameFor(taskA, "run"));
+
+        // The quota's one pod slot is now held by A's pod, so B's pod-create
+        // 403s and the adapter rethrows it as QuotaExceededError.
+        await sbxB.provision();
+        await expect(
+          sbxB.runCommand(taskB, "echo hi", {
+            cwd: "/home/agent/workspace",
+            timeoutSeconds: 60,
+          }),
+        ).rejects.toBeInstanceOf(QuotaExceededError);
+
+        // Free the slot: dispose A's pod, then retry B — it should now
+        // succeed against the same taskId/pod name (A's create never
+        // actually landed, so there's no name to collide with).
+        await sbxA.dispose();
+        await Promise.race([bgA, new Promise((resolve) => setTimeout(resolve, 20_000))]);
+
+        const res = await sbxB.runCommand(taskB, "echo hi", {
+          cwd: "/home/agent/workspace",
+          timeoutSeconds: 60,
+        });
+        expect(res.exitCode).toBe(0);
+        expect(res.stdout).toContain("hi");
+      } finally {
+        // Always tear down both sandboxes' pods/secrets, best-effort — dispose()
+        // is safe to call even on a sandbox whose pod-create was rejected (it
+        // never actually landed, so the delete is a harmless no-op).
+        await sbxA.dispose().catch(() => {});
+        await sbxB.dispose().catch(() => {});
+        // Always delete the quota to restore the "no quota yet" state. As
+        // HANDOVER.md flags for Plan 5's Case B: this case creates no PVCs
+        // (both sandboxes provision an ephemeral emptyDir workspace), but a
+        // run that crashes before reaching this `finally` can still leave the
+        // `it-sandbox-quota` object — or A's pod, still holding the one slot —
+        // behind in `lastlight-sandboxes`; a repeated run would then need a
+        // manual `kubectl delete resourcequota/pod` before it can proceed.
+        await apis.core
+          .deleteNamespacedResourceQuota({ name: QUOTA_NAME, namespace: NAMESPACE })
+          .catch(() => {});
       }
     },
     180_000,
