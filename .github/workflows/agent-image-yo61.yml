@@ -1,0 +1,80 @@
+# Fork-only helper — builds the Last Light harness image (agent + QEMU) and
+# pushes it to ghcr.io/yo61 for Robin's homelab k8s cluster to pull. It exists
+# because the upstream publish.yml is hardcoded to ghcr.io/nearform, so there is
+# no repeatable path to rebuild the yo61 harness image otherwise.
+#
+# NOT for upstream (nearform) — this targets the yo61 org registry only. Keep it
+# off the `feat/k8s-sandbox-backend` branch (a potential upstream PR); it lives
+# on the fork's default branch so `workflow_dispatch` is registered.
+#
+# Builds the `agent-qemu` target (harness + QEMU) from apps/server/docker-bake.hcl.
+# `agent-qemu` depends on `agent` (contexts = target:agent), so the base agent is
+# built in the same bake graph as a content-keyed context but is not itself
+# pushed — the cluster only needs `lastlight-agent-qemu`. Dispatch it against the
+# ref that carries the code you want baked (e.g. `main` once the k8s sandbox
+# backend is merged) via the "Use workflow from" branch selector.
+#
+# GIT_SHA / BUILD_DATE feed the agent image's drift banner
+# (GET /admin/api/server/info); passing github.sha keeps the deployed image's
+# reported version honest. Pin the homelab Deployment to an immutable tag by
+# dispatching with `tag` = the short commit SHA (matches the existing
+# `lastlight-agent-qemu:<sha>` convention), not `latest`.
+
+name: Build agent image (yo61)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to push to ghcr.io/yo61/lastlight-agent-qemu (e.g. the short commit SHA; default: latest)"
+        required: false
+        default: latest
+        type: string
+
+concurrency:
+  group: agent-image-yo61-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write # push the image to GHCR (ghcr.io/yo61)
+
+jobs:
+  agent-image:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io/yo61
+      TAG: ${{ inputs.tag }}
+      # Trusted first-party build reading its own repo-root context
+      # (context = "../.." in docker-bake.hcl); disable the buildx parent-dir
+      # filesystem entitlement guard — the sanctioned escape hatch, same as
+      # publish.yml and sandbox-image-yo61.yml use.
+      BUILDX_BAKE_ENTITLEMENTS_FS: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Invoke from apps/server/ so the bake file's `context = "../.."` resolves
+      # to the repo root (buildx resolves bake relative paths against the working
+      # dir, not the -f file's location).
+      - name: Build & push agent-qemu → ghcr.io/yo61
+        working-directory: apps/server
+        run: |
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export BUILD_DATE
+          docker buildx bake -f docker-bake.hcl --push agent-qemu
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          TAG: ${{ env.TAG }}
+          GIT_SHA: ${{ github.sha }}

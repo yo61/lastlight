@@ -250,6 +250,64 @@ describe("runWorkflow — basic phase execution", () => {
   });
 });
 
+describe("runWorkflow — backpressure", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns backpressure:true when a phase hits error_quota", async () => {
+    mockExecuteAgent.mockResolvedValue({
+      success: false,
+      output: "",
+      turns: 0,
+      durationMs: 1,
+      error: "exceeded quota: pods",
+      stopReason: "error_quota",
+    });
+
+    const result = await runWorkflow(SIMPLE_WORKFLOW, BASE_CTX, {} as never, {});
+    expect(result.success).toBe(false);
+    expect(result.backpressure).toBe(true);
+  });
+
+  it("does not set backpressure for a normal phase failure", async () => {
+    mockExecuteAgent.mockResolvedValue({
+      success: false,
+      output: "",
+      turns: 0,
+      durationMs: 1,
+      error: "agent crashed",
+      stopReason: "error_agent",
+    });
+
+    const result = await runWorkflow(SIMPLE_WORKFLOW, BASE_CTX, {} as never, {});
+    expect(result.success).toBe(false);
+    expect(result.backpressure).toBeFalsy();
+  });
+
+  it("detects error_quota from a bash/script phase via executeCommand", async () => {
+    const workflow: AgentWorkflowDefinition = {
+      kind: "agent",
+      name: "bash-quota",
+      phases: [
+        { name: "phase_0", type: "context" },
+        { name: "run_it", type: "bash", command: "echo hi" },
+      ],
+    };
+    mockExecuteCommand.mockResolvedValue({
+      success: false,
+      output: "",
+      turns: 0,
+      durationMs: 1,
+      error: "exceeded quota: pods",
+      stopReason: "error_quota",
+    });
+
+    const result = await runWorkflow(workflow, BASE_CTX, {} as never, {});
+    expect(result.backpressure).toBe(true);
+  });
+});
+
 describe("runWorkflow — guardrails on_output rules", () => {
   beforeEach(() => {
     vi.clearAllMocks();

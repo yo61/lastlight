@@ -1,0 +1,68 @@
+# Fork-only helper — builds the lean sandbox image and pushes it to
+# ghcr.io/yo61 for Robin's homelab k8s cluster to pull. It exists because a
+# local cross-arch build on Apple Silicon segfaults under QEMU while installing
+# `uv` (an emulation artifact — the amd64 binary runs fine natively); an
+# ubuntu-latest runner is native amd64, so no emulation is involved.
+#
+# NOT for upstream (nearform) — this targets the yo61 org registry only. Keep it
+# off the `feat/k8s-sandbox-backend` branch (a potential upstream PR); it lives
+# on the fork's default branch so `workflow_dispatch` is registered.
+#
+# Builds ONLY the `sandbox` target. Its `sandbox-base` dependency is built
+# content-keyed in the same bake graph (see apps/server/docker-bake.hcl) but is
+# not itself pushed — the cluster only needs `lastlight-sandbox`.
+
+name: Build sandbox image (yo61)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to push to ghcr.io/yo61/lastlight-sandbox (default: latest)"
+        required: false
+        default: latest
+        type: string
+
+concurrency:
+  group: sandbox-image-yo61-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write # push the image to GHCR (ghcr.io/yo61)
+
+jobs:
+  sandbox-image:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io/yo61
+      TAG: ${{ inputs.tag }}
+      # Trusted first-party build reading its own repo-root context
+      # (context = "../.." in docker-bake.hcl); disable the buildx parent-dir
+      # filesystem entitlement guard — the sanctioned escape hatch, same as
+      # publish.yml uses.
+      BUILDX_BAKE_ENTITLEMENTS_FS: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Invoke from apps/server/ so the bake file's `context = "../.."` resolves
+      # to the repo root (buildx resolves bake relative paths against the working
+      # dir, not the -f file's location).
+      - name: Build & push sandbox → ghcr.io/yo61
+        working-directory: apps/server
+        run: docker buildx bake -f docker-bake.hcl --push sandbox
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          TAG: ${{ env.TAG }}

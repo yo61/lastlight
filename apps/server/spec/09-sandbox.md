@@ -173,6 +173,66 @@ and doesn't expose the egress allowlist.
 - `SMOLVM_BIN` overrides the binary path; `smolAvailable()` self-skips when
   absent. Teardown is `machine delete -f`.
 
+### `kubernetes` — Kubernetes backend, in development
+
+> **In development, not yet the default.** Enable with
+> `LASTLIGHT_SANDBOX=kubernetes`. This section documents only the
+> concurrency model so far — the rest (pod lifecycle, egress, workspace
+> PVCs, skill delivery) lands with the backend's own docs-sync once it
+> reaches feature-complete.
+
+Runs each workflow phase as its own bare Pod (create → wait-for-start →
+stream JSONL stdout → reap) via `KubernetesSandbox`
+(`src/sandbox/k8s/kubernetes-sandbox.ts`) — a structural peer of `docker`
+and `smol` behind the same `Sandbox` port, using per-namespace Pod
+isolation instead of a shared host.
+
+#### Concurrency
+
+The backend enforces no concurrency cap of its own — the cluster
+namespace's `ResourceQuota` is the sole authority, and the app never reads
+or tunes its value:
+
+- The harness admits k8s-backend runs freely, gated only by an
+  absurdly-high sanity fuse (`K8S_SANITY_FUSE = 1000`,
+  `src/workflows/admission.ts`) — a runaway-loop backstop, not a tuned
+  concurrency limit.
+- Each phase attempts its own Pod create. When the namespace
+  `ResourceQuota` is full, the API server rejects the create with
+  `403 ... exceeded quota ...`; `KubernetesSandbox` maps that specific
+  rejection to a typed `QuotaExceededError` (`src/sandbox/k8s/quota.ts`),
+  distinct from every other create failure.
+- The orchestrator (`src/engine/executors/orchestrator.ts`) catches
+  `QuotaExceededError` and stamps the phase result
+  `stopReason: "error_quota"` instead of failing the run.
+- `runWorkflow` (`src/workflows/runner.ts`) detects
+  `stopReason: "error_quota"` and returns a
+  `WorkflowResult & { backpressure: true }` — a server-layer
+  intersection, not an engine change (see [Workflow Engine → Concurrency
+  cap and
+  admission](/spec/06-workflow-engine#concurrency-cap-and-admission)).
+  `simple.ts` reacts to `backpressure` by calling
+  `db.runs.requeueRunning()`, flipping the run `running → queued` instead
+  of `failed` — the run stays live and waits for a slot instead of
+  terminating.
+- The `AdmissionController` (`src/workflows/admission.ts`) runs in a
+  **backpressure mode** for this backend
+  (`backpressureMode: config.sandbox === "kubernetes"`): it gates
+  promotion on `K8S_SANITY_FUSE` instead of `maxWorkflows`, and promotes
+  at most **one** queued run per `admitNext()` call — each promotion is
+  itself a quota probe (the promoted run re-queues immediately if the
+  quota is still full), so probing one at a time avoids a burst of
+  simultaneously rejected creates. Backlog drains at the periodic sweep
+  cadence (15 s) plus real completions, whichever frees a slot first.
+
+Real enforcement needs a namespace `ResourceQuota` object to actually
+exist — that ships with Plan 7's Flux manifests. Until then the mechanism
+is build- and unit-tested, plus validated against a quota staged manually
+via admin cluster credentials (the opt-in `KubernetesSandbox Plan 6
+quota-backpressure` case in
+`tests/sandbox/k8s/kubernetes.integration.test.ts`, gated behind
+`RUN_K8S_IT=1`).
+
 ### `none` — in-process
 
 For local development. agentic-pi runs in the harness process with

@@ -4,12 +4,14 @@ import { tmpdir } from "os";
 import { spawnSync } from "child_process";
 import type { run as agenticRunType, RunResult, ThinkingLevel } from "agentic-pi";
 import type { OtelConfig, SandboxBackend } from "../config/config.js";
+import { resolveKubernetesConfig } from "../config/config.js";
 import { createTaskSandbox, setupTaskWorktree, prePopulateWorkspace } from "./index.js";
 import { GITHUB_EXTRAHEADER_KEY, githubExtraheaderValue } from "./git-http-auth.js";
 import type { DockerSandbox as DockerDriver } from "./docker.js";
 import { SmolSandbox as SmolDriver, smolAvailable, SMOL_WORKSPACE_DIR } from "./smol.js";
 import { ALLOW_ALL_SENTINEL } from "./egress-allowlist.js";
 import { getDockerSandboxOtelEnv, getOtelEnvForSandbox } from "../telemetry/index.js";
+import { KubernetesSandbox } from "./k8s/kubernetes-sandbox.js";
 import {
   DOCKER_WORKSPACE_DIR,
   SKILL_BUNDLE_ROOT,
@@ -234,6 +236,19 @@ export function sandboxFor(backend: SandboxBackend, opts: SandboxFactoryOpts): S
       return new InProcessSandbox("gondolin", opts);
     case "none":
       return new InProcessSandbox("none", opts);
+    case "kubernetes": {
+      const k = resolveKubernetesConfig();
+      return new KubernetesSandbox(opts, {
+        namespace: k.namespace,
+        image: opts.imageName ?? k.image,
+        storageClassName: k.storageClassName,
+        workspaceSize: k.workspaceSize,
+        runAsUser: k.runAsUser,
+        harnessEndpoint: k.harnessEndpoint,
+        harnessNamespace: k.harnessNamespace,
+        harnessPodLabels: k.harnessPodLabels,
+      });
+    }
   }
 }
 
@@ -678,7 +693,7 @@ function asError(e: Error | string): Error {
  * subprocess (docker/smol) drivers: apply the cheap `{`-prefix guard, parse
  * JSON, and forward the parsed record. Non-JSON / malformed lines are dropped.
  */
-function parseLine(onEvent: (record: SandboxEvent) => void): (line: string) => void {
+export function parseLine(onEvent: (record: SandboxEvent) => void): (line: string) => void {
   return (line: string) => {
     if (!line.startsWith("{")) return;
     let record: SandboxEvent;
