@@ -1,20 +1,25 @@
 import { createReadStream, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { Readable } from "node:stream";
+import { type Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { createGunzip } from "node:zlib";
 import type { ArtifactBackend } from "./artifact-backend.js";
 
 const DEFAULT_TTL_MS = 30 * 60_000;
 const DEFAULT_MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_DECOMPRESSED_BYTES = 128 * 1024 * 1024;
 const LASTLIGHT_PREFIX = `.lastlight${sep}`;
 
-/** Thrown by `unpack` when the uploaded bundle exceeds `maxBundleBytes`. Route
- *  handlers should map this to HTTP 413. */
+/** Thrown by `unpack` when the uploaded bundle exceeds `maxBundleBytes`
+ *  (compressed) or `maxDecompressedBytes` (a zip-bomb guard — a small
+ *  compressed upload expanding far past what a `.lastlight/` bundle needs).
+ *  Route handlers should map this to HTTP 413. */
 export class ArtifactTooLarge extends Error {
-  constructor(maxBytes: number) {
-    super(`artifact bundle exceeds the ${maxBytes}-byte cap`);
+  constructor(maxBytes: number, kind: "compressed" | "decompressed" = "compressed") {
+    super(`artifact bundle exceeds the ${maxBytes}-byte ${kind} cap`);
     this.name = "ArtifactTooLarge";
   }
 }
@@ -32,7 +37,8 @@ export interface ArtifactStore {
   /** Resolve a bearer token to its runKey (or undefined → the route 401s). */
   resolve(token: string): string | undefined;
   /** Stream a gzipped-tar upload body into the run's namespace via the backend,
-   *  enforcing the size cap + per-entry traversal guards. Throws on cap/traversal. */
+   *  enforcing the compressed + decompressed size caps and per-entry traversal
+   *  guards. Throws (`ArtifactTooLarge` or a plain `Error`) on cap/traversal. */
   unpack(token: string, body: Readable): Promise<void>;
   /** Drop a run's token (called on dispose) — the bytes are GC'd separately. */
   evict(token: string): void;
@@ -72,46 +78,78 @@ class TokenRegistry {
   }
 }
 
-/** Read `body` into memory, throwing `ArtifactTooLarge` the moment the running
- *  total crosses `maxBytes` (stops reading immediately — the for-await loop's
- *  early exit destroys the underlying stream). */
-async function readCapped(body: Readable, maxBytes: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
+/** A `Transform` that counts bytes passing through and aborts (errors) the
+ *  instant the running total crosses `maxBytes` — used both before gunzip
+ *  (compressed cap) and after it (decompressed cap, the zip-bomb guard). */
+function capTransform(maxBytes: number, kind: "compressed" | "decompressed"): Transform {
   let total = 0;
-  for await (const chunk of body) {
-    const buf: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    total += buf.length;
-    if (total > maxBytes) {
-      throw new ArtifactTooLarge(maxBytes);
-    }
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks);
-}
-
-/** Extract stderr text from an `execFileSync` failure, falling back to the
- *  error's own message. */
-function execErrorDetail(err: unknown): string {
-  if (err && typeof err === "object" && "stderr" in err) {
-    const stderr = (err as { stderr?: unknown }).stderr;
-    if (Buffer.isBuffer(stderr)) return stderr.toString("utf8").trim();
-    if (typeof stderr === "string") return stderr.trim();
-  }
-  return err instanceof Error ? err.message : String(err);
+  return new Transform({
+    transform(chunk: Buffer, _enc, callback) {
+      total += chunk.length;
+      if (total > maxBytes) {
+        callback(new ArtifactTooLarge(maxBytes, kind));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
 }
 
 /**
- * Extract a gzipped tar buffer into `destDir` via system `tar` (no npm dep —
- * matches `skill-bundle.ts`'s style). Both GNU tar and bsdtar refuse to
- * extract entries whose name contains `..` (or an absolute path), exiting
- * non-zero — that's the first traversal guard, before the store's own
- * `.lastlight/`-prefix check ever runs.
+ * Stream `body` (gzipped tar) into `destDir` via system `tar` (no npm dep —
+ * matches `skill-bundle.ts`'s style): `body` → compressed-byte cap → gunzip →
+ * decompressed-byte cap → `tar -xf -`. Both caps abort the pipeline the
+ * instant they're crossed, before the excess bytes ever reach `tar` or disk.
+ *
+ * Traversal defense: both GNU tar and bsdtar refuse to extract entries whose
+ * name contains `..` (or an absolute path), exiting non-zero — that's the
+ * first guard, before the store's own `.lastlight/`-prefix check ever runs.
  */
-function extractTar(tarBuffer: Buffer, destDir: string): void {
+async function extractTarStream(
+  body: Readable,
+  destDir: string,
+  maxBundleBytes: number,
+  maxDecompressedBytes: number,
+): Promise<void> {
+  const child = spawn("tar", ["-xf", "-", "-C", destDir], { stdio: ["pipe", "ignore", "pipe"] });
+  const { stdin, stderr } = child;
+  if (!stdin || !stderr) {
+    throw new Error("failed to spawn tar: missing stdio pipes");
+  }
+
+  let stderrText = "";
+  stderr.on("data", (chunk: Buffer) => {
+    stderrText += chunk.toString("utf8");
+  });
+
+  const exitCode = new Promise<number>((resolveExit, rejectExit) => {
+    child.on("error", rejectExit);
+    child.on("close", (code) => resolveExit(code ?? -1));
+  });
+
+  let pipelineError: unknown;
   try {
-    execFileSync("tar", ["-xzf", "-", "-C", destDir], { input: tarBuffer });
+    await pipeline(
+      body,
+      capTransform(maxBundleBytes, "compressed"),
+      createGunzip(),
+      capTransform(maxDecompressedBytes, "decompressed"),
+      stdin,
+    );
   } catch (err) {
-    throw new Error(`artifact bundle extraction failed: ${execErrorDetail(err)}`);
+    pipelineError = err;
+  }
+
+  const code = await exitCode;
+
+  if (pipelineError instanceof ArtifactTooLarge) throw pipelineError;
+  if (pipelineError) {
+    const detail = pipelineError instanceof Error ? pipelineError.message : String(pipelineError);
+    throw new Error(`artifact bundle extraction failed: ${detail}`);
+  }
+  if (code !== 0) {
+    const detail = stderrText.trim() || `tar exited with code ${code}`;
+    throw new Error(`artifact bundle extraction failed: ${detail}`);
   }
 }
 
@@ -138,21 +176,22 @@ function assertUnderLastlight(relPath: string): void {
 }
 
 /**
- * Unpack one upload: size-capped read → extract to a scratch dir → per-entry
- * `.lastlight/`-prefix guard → `backend.put` each file → scratch dir removed.
- * Validates every entry before `put`-ing any of them, so a bundle with one bad
- * entry lands nothing.
+ * Unpack one upload: streamed + double-capped extract (compressed AND
+ * decompressed byte caps — the second is the zip-bomb guard) to a scratch
+ * dir → per-entry `.lastlight/`-prefix guard → `backend.put` each file →
+ * scratch dir removed. Validates every entry before `put`-ing any of them, so
+ * a bundle with one bad entry lands nothing.
  */
 async function unpackBundle(
   backend: ArtifactBackend,
   runKey: string,
   body: Readable,
   maxBundleBytes: number,
+  maxDecompressedBytes: number,
 ): Promise<void> {
-  const tarBuffer = await readCapped(body, maxBundleBytes);
   const extractDir = mkdtempSync(join(tmpdir(), "ll-artifact-"));
   try {
-    extractTar(tarBuffer, extractDir);
+    await extractTarStream(body, extractDir, maxBundleBytes, maxDecompressedBytes);
     const relPaths = listExtractedFiles(extractDir, extractDir);
     for (const relPath of relPaths) assertUnderLastlight(relPath);
     for (const relPath of relPaths) {
@@ -165,9 +204,10 @@ async function unpackBundle(
 
 export function createArtifactStore(
   backend: ArtifactBackend,
-  opts?: { maxBundleBytes?: number; ttlMs?: number },
+  opts?: { maxBundleBytes?: number; maxDecompressedBytes?: number; ttlMs?: number },
 ): ArtifactStore {
   const maxBundleBytes = opts?.maxBundleBytes ?? DEFAULT_MAX_BUNDLE_BYTES;
+  const maxDecompressedBytes = opts?.maxDecompressedBytes ?? DEFAULT_MAX_DECOMPRESSED_BYTES;
   const registry = new TokenRegistry(opts?.ttlMs ?? DEFAULT_TTL_MS);
 
   return {
@@ -183,7 +223,7 @@ export function createArtifactStore(
     async unpack(token, body) {
       const runKey = registry.resolve(token);
       if (!runKey) throw new Error(`unknown artifact token`);
-      await unpackBundle(backend, runKey, body, maxBundleBytes);
+      await unpackBundle(backend, runKey, body, maxBundleBytes, maxDecompressedBytes);
     },
     async gc(runKey) {
       await backend.remove(runKey);
