@@ -368,7 +368,7 @@ export async function runSimpleWorkflow(
     if (overCap) {
       await notify(
         `\`${workflowName}\` is queued — the concurrency limit` +
-        ` (${concurrency!.maxWorkflows}) is reached.` +
+        ` (${admitCap}) is reached.` +
         ` It'll start automatically when a slot frees.`,
       );
       return { success: true, queued: true, phases: [] };
