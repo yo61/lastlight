@@ -200,6 +200,10 @@ describe("runSimpleWorkflow — concurrency cap (issue #172)", () => {
     );
 
     expect(result.queued).toBeFalsy(); // NOT capped by maxWorkflows on k8s
+    // Prove it actually admitted + dispatched (not a silent early return): the
+    // workflow ran, so runWorkflow was invoked and the result reflects it.
+    expect(mockRunWorkflow).toHaveBeenCalledOnce();
+    expect(result.success).toBe(true);
   });
 
   it("requeues the run (running -> queued) when runWorkflow reports backpressure", async () => {

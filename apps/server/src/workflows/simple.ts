@@ -366,9 +366,14 @@ export async function runSimpleWorkflow(
     });
     console.log(`[simple] Created workflow run ${workflowId} (${workflowName}) status=${runStatus}`);
     if (overCap) {
+      // On k8s the cap is the runaway-loop sanity fuse (the ResourceQuota is the
+      // real authority), not a tuned concurrency limit — word it accurately.
+      const capReason =
+        config.sandbox === "kubernetes"
+          ? `the safety fuse (${admitCap}) is reached`
+          : `the concurrency limit (${admitCap}) is reached`;
       await notify(
-        `\`${workflowName}\` is queued — the concurrency limit` +
-        ` (${admitCap}) is reached.` +
+        `\`${workflowName}\` is queued — ${capReason}.` +
         ` It'll start automatically when a slot frees.`,
       );
       return { success: true, queued: true, phases: [] };

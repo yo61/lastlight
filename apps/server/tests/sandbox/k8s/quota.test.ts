@@ -1,10 +1,14 @@
 import { describe, it, expect } from "vitest";
 import { ApiException } from "@kubernetes/client-node";
-import { QuotaExceededError, isQuotaExceeded } from "../../../src/sandbox/k8s/quota.js";
+import { QuotaExceededError, isQuotaExceeded } from "#src/sandbox/k8s/quota.js";
 
-function apiErr(code: number, message: string): ApiException<unknown> {
-  // ApiException<T>(code, message, body, headers)
-  return new ApiException(code, message, { message }, {});
+// ApiException<T>(code, message, body, headers). Its `.message` is COMPOSED as
+// `HTTP-Code: … \nMessage: <message> \nBody: <JSON.stringify(body)> …`, so the
+// top-level `message` arg AND the serialized body both land in `err.message`.
+// `body` defaults to `{ message }` (the common k8s Status shape); pass an
+// explicit `body` to exercise the body-less path.
+function apiErr(code: number, message: string, body: unknown = { message }): ApiException<unknown> {
+  return new ApiException(code, message, body, {});
 }
 
 describe("isQuotaExceeded", () => {
@@ -18,6 +22,14 @@ describe("isQuotaExceeded", () => {
 
   it("is case-insensitive on the quota phrase", () => {
     expect(isQuotaExceeded(apiErr(403, "Exceeded Quota: foo"))).toBe(true);
+  });
+
+  it("detects a quota rejection carried only in the composed message (body has no message field)", () => {
+    // `body.message` is absent, so the `body?.message` half of the dual-read
+    // contributes nothing — the match must come from the composed `err.message`.
+    // This pins the `err.message` read as load-bearing: dropping it regresses.
+    const err = apiErr(403, "pods is forbidden: exceeded quota: sandbox-quota", {});
+    expect(isQuotaExceeded(err)).toBe(true);
   });
 
   it("ignores a 403 RBAC-forbidden error (not a quota)", () => {
