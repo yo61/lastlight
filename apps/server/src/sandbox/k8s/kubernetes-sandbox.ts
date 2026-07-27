@@ -30,6 +30,7 @@ import {
   SKILLS_MOUNT_DIR,
   type SkillBundleRegistry,
 } from "./skill-bundle.js";
+import { QuotaExceededError, isQuotaExceeded } from "./quota.js";
 
 type Workspace = PodSpecInput["workspace"];
 
@@ -443,6 +444,13 @@ export class KubernetesSandbox implements Sandbox {
     } catch (err) {
       await this.deleteSecretBestEffort(credsName);
       if (promptName) await this.deleteSecretBestEffort(promptName);
+      // A ResourceQuota rejection is backpressure, not a failure: rethrow a
+      // typed error so the orchestrator stamps `error_quota` and the run
+      // requeues (design.md §8). Every other create error propagates as-is.
+      if (isQuotaExceeded(err)) {
+        const body = (err as { body?: { message?: string } }).body;
+        throw new QuotaExceededError(body?.message ?? "pod create rejected by ResourceQuota");
+      }
       throw err;
     }
   }
