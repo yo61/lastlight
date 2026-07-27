@@ -14,6 +14,7 @@ import { join } from "path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { executeAgent, executeCommand } from "#src/engine/agent-executor.js";
 import { FakeSandbox, type SandboxEvent } from "#src/sandbox/sandbox.js";
+import { QuotaExceededError } from "#src/sandbox/k8s/quota.js";
 
 /** Poll a predicate for up to `timeoutMs` — the agent-path shim flushes its
  * jsonl fire-and-forget (`void shim.flush()`), so the write lands just after
@@ -118,6 +119,46 @@ describe("Sandbox orchestrator (FakeSandbox)", () => {
     expect(result.error).toContain("kaboom in the sandbox");
     // Even on failure the workspace is disposed (the bracket's finally).
     expect(fake.disposed).toBe(true);
+  });
+
+  it("maps a QuotaExceededError to stopReason error_quota on the agent path", async () => {
+    const fake = new FakeSandbox({ throwOnRunAgent: new QuotaExceededError("exceeded quota: pods") });
+
+    const result = await executeAgent(
+      "do the thing",
+      { sandbox: "none", stateDir, sessionsDir },
+      { sandboxFactory: fake.asFactory() },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.stopReason).toBe("error_quota");
+    expect(result.error).toContain("exceeded quota");
+  });
+
+  it("keeps error_sandbox for a generic sandbox throw on the agent path", async () => {
+    const fake = new FakeSandbox({ throwOnRunAgent: new Error("boom") });
+
+    const result = await executeAgent(
+      "do the thing",
+      { sandbox: "none", stateDir, sessionsDir },
+      { sandboxFactory: fake.asFactory() },
+    );
+
+    expect(result.stopReason).toBe("error_sandbox");
+  });
+
+  it("maps a QuotaExceededError to stopReason error_quota on the command path", async () => {
+    const fake = new FakeSandbox({ throwOnRunCommand: new QuotaExceededError("exceeded quota: pods") });
+
+    const result = await executeCommand(
+      { kind: "bash", command: "echo hi" },
+      { sandbox: "none", stateDir, sessionsDir },
+      { sandboxFactory: fake.asFactory() },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.stopReason).toBe("error_quota");
+    expect(result.error).toContain("exceeded quota");
   });
 
   it("computes a strict EgressPolicy by default and passes it at construction", async () => {
