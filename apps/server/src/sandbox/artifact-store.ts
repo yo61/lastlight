@@ -6,7 +6,9 @@ import { randomUUID } from "node:crypto";
 import { type Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
+import { getRuntimeConfig } from "../config/config.js";
 import type { ArtifactBackend } from "./artifact-backend.js";
+import { LocalArtifactBackend } from "./artifact-backend.js";
 
 const DEFAULT_TTL_MS = 30 * 60_000;
 const DEFAULT_MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
@@ -230,3 +232,30 @@ export function createArtifactStore(
     },
   };
 }
+
+/**
+ * Process-wide singleton — mirrors `skillBundleRegistry`
+ * (`k8s/skill-bundle.ts`): the k8s adapter's default `register`s a run's
+ * token here, and the `/internal/sandbox-artifacts` route (mounted on the
+ * same instance) `resolve`s it here, so both sides of a real run agree on
+ * the same in-memory token table. Wiring either side to a fresh
+ * `createArtifactStore(...)` instead of this export is the bug Task 4 left
+ * behind — every upload would 401 (the adapter's token lives in a registry
+ * the route never reads). Inject an explicit `ArtifactStore` only in tests.
+ *
+ * `rootFor` mirrors `post-review.ts`'s `resolveHostRepoDir`: the run's host
+ * dir is `<sandboxDir>/<taskId>` — the workDir itself, NOT a repo subdir,
+ * because the in-pod upload script tars `.lastlight/` from its cwd, so the
+ * bundle always unpacks to `<workDir>/.lastlight/`, which
+ * `resolveHostRepoDir`'s existing `workDir/.lastlight` fallback already
+ * reads. `sandboxDir` is resolved from `getRuntimeConfig()` LAZILY, per call
+ * (not memoized at module-import time), because config loads after this
+ * module is first imported.
+ */
+export const artifactStore: ArtifactStore = createArtifactStore(
+  new LocalArtifactBackend((taskId) => {
+    const sandboxBase =
+      getRuntimeConfig()?.sandboxDir ?? join(process.env.STATE_DIR || "data", "sandboxes");
+    return join(sandboxBase, taskId);
+  }),
+);

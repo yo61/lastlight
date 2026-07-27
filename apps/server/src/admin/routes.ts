@@ -49,6 +49,7 @@ import {
   resolveKubernetesConfig,
 } from "../config/config.js";
 import { reapSandboxWorkspace } from "../sandbox/reap.js";
+import { artifactStore } from "../sandbox/artifact-store.js";
 import { reclaimSandbox } from "../sandbox/k8s/reclaim.js";
 import { makeK8sApis } from "../sandbox/k8s/client.js";
 import { sanitizeLabelValue } from "../sandbox/k8s/naming.js";
@@ -1506,6 +1507,19 @@ export function createAdminRoutes(
           stateDir: config.stateDir,
           sandboxDir: getRuntimeConfig()?.sandboxDir,
         }).removed;
+        // GC the artifact-store namespace too (Plan 8), same "only when the
+        // workspace dir actually went away" rule as reapOnSuccess (simple.ts)
+        // — redundant with the rmSync above for the local backend, but the
+        // hook a future S3 backend needs. Cancel is a full-run abort (not a
+        // per-phase dispose), so this can never race a still-in-flight
+        // post-review the way an eager dispose-time gc would.
+        if (reaped) {
+          try {
+            await artifactStore.gc(storedTaskId);
+          } catch (err) {
+            console.warn(`[cancel] artifact gc failed for ${storedTaskId}:`, err);
+          }
+        }
       }
     }
     return c.json({ cancelled: id, killedContainers: killed, reapedWorkspace: reaped });

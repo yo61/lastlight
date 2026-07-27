@@ -1,4 +1,3 @@
-import { join, resolve } from "node:path";
 import { ApiException } from "@kubernetes/client-node";
 import type { V1Container, V1ContainerStatus, V1Pod } from "@kubernetes/client-node";
 import type { RunResult } from "agentic-pi";
@@ -14,8 +13,7 @@ import type {
 } from "../sandbox.js";
 import { parseLine } from "../sandbox.js";
 import type { SandboxBackend } from "../../config/config.js";
-import { createArtifactStore, type ArtifactStore } from "../artifact-store.js";
-import { LocalArtifactBackend } from "../artifact-backend.js";
+import { artifactStore, type ArtifactStore } from "../artifact-store.js";
 import { loadAgentContext } from "../../workflows/loader.js";
 import { makeK8sApis, type K8sApis } from "./client.js";
 import { buildPodManifest, WORKSPACE_DIR, PROMPT_FILE, AGENT_CONTEXT_FILE, type PodSpecInput } from "./pod.js";
@@ -87,12 +85,10 @@ export interface K8sAdapterConfig {
   apis?: K8sApis;
   /** Injectable registry for tests; defaults to the module singleton skillBundleRegistry. */
   skillRegistry?: SkillBundleRegistry;
-  /** Injectable artifact store (Task 6 wires the real, backend-shared instance
-   *  here — the same one the `/internal/sandbox-artifacts` route resolves
-   *  tokens against). Defaults to a per-instance `LocalArtifactBackend` rooted
-   *  at `<stateDir>/sandboxes/<taskId>`, matching `sandbox/index.ts`'s layout —
-   *  a working fallback for tests, never exercised once Task 6 injects the
-   *  real singleton. */
+  /** Injectable artifact store (tests only). Defaults to the module-wide
+   *  `artifactStore` singleton (`../artifact-store.js`) — the same instance
+   *  the `/internal/sandbox-artifacts` route resolves tokens against, so a
+   *  token this adapter registers is always resolvable by that route. */
   artifactStore?: ArtifactStore;
 }
 
@@ -171,13 +167,7 @@ export class KubernetesSandbox implements Sandbox {
     this.harnessNamespace = cfg.harnessNamespace;
     this.harnessPodLabels = cfg.harnessPodLabels;
     this.skillRegistry = cfg.skillRegistry ?? skillBundleRegistry;
-    this.artifactStore =
-      cfg.artifactStore ??
-      createArtifactStore(
-        new LocalArtifactBackend((taskId) =>
-          join(resolve(opts.sandboxDir || join(opts.stateDir, "sandboxes")), taskId),
-        ),
-      );
+    this.artifactStore = cfg.artifactStore ?? artifactStore;
   }
 
   async provision(pre?: PrePopulateSpec): Promise<ProvisionResult> {

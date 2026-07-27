@@ -12,7 +12,7 @@ import {
   EGRESS_POLICY_LABEL,
 } from "#src/sandbox/k8s/egress-policy.js";
 import { SkillBundleRegistry } from "#src/sandbox/k8s/skill-bundle.js";
-import { createArtifactStore } from "#src/sandbox/artifact-store.js";
+import { createArtifactStore, artifactStore as sharedArtifactStore } from "#src/sandbox/artifact-store.js";
 import { LocalArtifactBackend } from "#src/sandbox/artifact-backend.js";
 
 interface FakeOpts {
@@ -911,4 +911,38 @@ describe("KubernetesSandbox artifact upload", () => {
     const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
     expect(creds.stringData.LASTLIGHT_ARTIFACT_TOKEN).toBeUndefined();
   });
+
+  it(
+    "defaults to the module artifactStore singleton when none is injected — " +
+      "the same instance the /internal/sandbox-artifacts route resolves against",
+    async () => {
+      const { apis, secretsCreated } = fakeApis();
+      // No `artifactStore` override in these overrides — exercises the real
+      // default (`cfg.artifactStore ?? artifactStore` in kubernetes-sandbox.ts),
+      // which Task 6 points at the shared module singleton instead of a
+      // throwaway per-instance store.
+      const sbx = new KubernetesSandbox(factoryOpts, cfg(apis, { namespace: "ns-artifacts-default" }));
+      await sbx.provision();
+
+      await sbx.runAgent(
+        "t1",
+        "hello",
+        { model: "anthropic/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace" } as any,
+        () => {},
+      );
+
+      const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
+      const token = creds.stringData.LASTLIGHT_ARTIFACT_TOKEN;
+      expect(token).toBeTruthy();
+      // Resolved via the imported singleton directly (not a fresh store) —
+      // if the adapter's default ever regresses back to a per-instance store,
+      // this resolves to `undefined` and the test fails. `register` keys on
+      // `this.opts.taskId` (the constructor's `factoryOpts.taskId`, "t1"),
+      // not the `taskId` arg passed to `runAgent`.
+      expect(sharedArtifactStore.resolve(token)).toBe("t1");
+
+      await sbx.dispose();
+      expect(sharedArtifactStore.resolve(token)).toBeUndefined();
+    },
+  );
 });
