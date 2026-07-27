@@ -119,7 +119,10 @@ export async function withSandbox<T>(
   }
 }
 
-/** Drop AGENTS.md into the workspace — agentic-pi reads it as system context. */
+/** Drop AGENTS.md into the workspace — agentic-pi reads it as system context.
+ *  Host-shared backends only (docker/gondolin/none/smol); the k8s backend has
+ *  no host-visible workspace to write into — see the call site's guard and
+ *  `KubernetesSandbox.runAgent`'s pod-side delivery instead. */
 function writeAgentsMd(hostWorkspaceDir: string, config: ExecutorConfig): void {
   try {
     const md = loadAgentContext(config.agentContextDir);
@@ -171,7 +174,11 @@ export async function runSandboxedAgent(
 
   return withSandbox(ctx, async (sandbox, prov) => {
     console.log(`  [executor] Running agent (task: ${ctx.taskId}, sandbox: ${ctx.backend})`);
-    writeAgentsMd(prov.hostWorkspaceDir, config);
+    // `prov.hostWorkspaceDir` on k8s is an in-pod path (WORKSPACE_DIR) that
+    // doesn't exist on the harness host, so this write would always ENOENT.
+    // The k8s adapter delivers AGENTS.md pod-side instead (the per-run prompt
+    // Secret carries it; see KubernetesSandbox.runAgent).
+    if (ctx.backend !== "kubernetes") writeAgentsMd(prov.hostWorkspaceDir, config);
 
     // Stage this phase's skills (adapter decides symlink/copy + path mapping).
     let skillDirs: string[] | undefined;

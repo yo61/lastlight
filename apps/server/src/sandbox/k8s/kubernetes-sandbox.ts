@@ -16,8 +16,9 @@ import { parseLine } from "../sandbox.js";
 import type { SandboxBackend } from "../../config/config.js";
 import { createArtifactStore, type ArtifactStore } from "../artifact-store.js";
 import { LocalArtifactBackend } from "../artifact-backend.js";
+import { loadAgentContext } from "../../workflows/loader.js";
 import { makeK8sApis, type K8sApis } from "./client.js";
-import { buildPodManifest, WORKSPACE_DIR, PROMPT_FILE, type PodSpecInput } from "./pod.js";
+import { buildPodManifest, WORKSPACE_DIR, PROMPT_FILE, AGENT_CONTEXT_FILE, type PodSpecInput } from "./pod.js";
 import { podNameFor, sanitizeLabelValue } from "./naming.js";
 import { buildSecretManifest, podOwnerReference, secretNameFor } from "./secret.js";
 import { streamPodLog } from "./log-stream.js";
@@ -107,7 +108,11 @@ const egressEnsured = new Map<string, Promise<void>>();
  * handed a pre-clone descriptor (design B — the harness can't pre-clone
  * host-side, so an initContainer clones inside the pod) and falls back to an
  * ephemeral in-pod `emptyDir` otherwise. `runAgent` delivers the prompt via a
- * per-run prompt Secret mounted into the pod and piped to the agent's stdin.
+ * per-run prompt Secret mounted into the pod and piped to the agent's stdin;
+ * the resolved agent-context (persona/hard-rules) rides the same Secret as an
+ * `agents` key (Plan 8 Task 5 — the harness has no host-shared workspace to
+ * write AGENTS.md into on this backend), and the `runAgent` script copies it
+ * to `<cwd>/AGENTS.md` before the agent starts.
  * Both the creds and prompt Secrets are created BEFORE the Pod (a Pod whose
  * `envFrom`/volume mount names a missing Secret fails to start); once the Pod
  * exists, each Secret's `ownerReferences` is patched to the Pod's uid so
@@ -301,9 +306,18 @@ export class KubernetesSandbox implements Sandbox {
     // uploading artifacts must not turn a successful agent run into a
     // reported failure. The token travels via env (`LASTLIGHT_ARTIFACT_TOKEN`,
     // injected into the creds Secret below), never as a CLI arg.
+    //
+    // AGENTS.md (Plan 8 Task 5): the harness has no host-shared workspace to
+    // write it into on k8s (`writeAgentsMd` is skipped for this backend — see
+    // orchestrator.ts), so the resolved agent-context rides the same per-run
+    // prompt Secret as an `agents` key, mounted at AGENT_CONTEXT_FILE. The
+    // leading `cp` — a fixed, no-op-when-absent step — materializes it at
+    // `<cwd>/AGENTS.md` before agentic-pi starts, which reads it from cwd.
     this.artifactToken = this.artifactStore.register(this.opts.taskId);
+    const agentContext = loadAgentContext();
     const skillFlags = (opts.skillDirs ?? []).map((d) => `--skill ${d}`).join(" ");
     const script =
+      `if [ -f ${AGENT_CONTEXT_FILE} ]; then cp ${AGENT_CONTEXT_FILE} AGENTS.md; fi\n` +
       `agentic-pi run --model "$1" --sandbox none --no-session ${skillFlags} ` +
       `< ${PROMPT_FILE} ; rc=$?\n` +
       `if [ -d .lastlight ]; then\n` +
@@ -319,6 +333,7 @@ export class KubernetesSandbox implements Sandbox {
       cwd: opts.agentCwd,
       onLine: parseLine(onEvent),
       promptText: prompt,
+      agentContext,
     });
     return undefined; // orchestrator reconstructs the result from the streamed events
   }
@@ -377,8 +392,12 @@ export class KubernetesSandbox implements Sandbox {
     /** Prompt text for a `runAgent` call — creates a prompt Secret mounted
      *  into the pod. Omitted for `runCommand` (no prompt to deliver). */
     promptText?: string;
+    /** Resolved agent-context for a `runAgent` call — rides the same prompt
+     *  Secret as an `agents` key (see AGENT_CONTEXT_FILE). Empty/omitted →
+     *  no key, no extra mount item; never set for `runCommand`. */
+    agentContext?: string;
   }): Promise<void> {
-    const { taskId, command, env, cwd, onLine, timeoutSeconds, promptText } = input;
+    const { taskId, command, env, cwd, onLine, timeoutSeconds, promptText, agentContext } = input;
     const name = podNameFor(taskId, "run");
     this.activePod = name;
     await this.ensureEgress();
@@ -421,7 +440,7 @@ export class KubernetesSandbox implements Sandbox {
         body: buildSecretManifest({
           name: promptName,
           namespace: this.ns,
-          data: { prompt: promptText },
+          data: { prompt: promptText, ...(agentContext ? { agents: agentContext } : {}) },
           labels: { "lastlight.io/pod": name },
         }),
       });
@@ -465,6 +484,7 @@ export class KubernetesSandbox implements Sandbox {
       command,
       envFromSecret: credsName,
       promptSecret: promptName,
+      agentContextMount: Boolean(agentContext),
       cwd,
       activeDeadlineSeconds: timeoutSeconds ?? this.opts.timeoutSeconds ?? 1800,
       runAsUser: this.runAsUser,

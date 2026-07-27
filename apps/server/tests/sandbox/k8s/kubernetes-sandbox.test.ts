@@ -1,10 +1,11 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { PassThrough } from "node:stream";
 import { ApiException } from "@kubernetes/client-node";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KubernetesSandbox } from "#src/sandbox/k8s/kubernetes-sandbox.js";
+import { configureWorkflowAssets } from "#src/workflows/loader.js";
 import {
   STRICT_POLICY_NAME,
   OPEN_POLICY_NAME,
@@ -560,6 +561,83 @@ describe("KubernetesSandbox PVC workspace (pre-clone)", () => {
     expect(pod.spec.initContainers[0].envFrom).toContainEqual({
       secretRef: { name: credsSecretName },
     });
+  });
+});
+
+describe("KubernetesSandbox (agent-context delivery — Plan 8 Task 5)", () => {
+  const pre = { owner: "acme", repo: "web", branch: "feature/x", token: "ghs_x" };
+  let ctxRoot: string;
+
+  afterEach(() => {
+    configureWorkflowAssets();
+    if (ctxRoot) rmSync(ctxRoot, { recursive: true, force: true });
+  });
+
+  it("delivers the resolved agent-context via the prompt Secret and copies it to AGENTS.md", async () => {
+    ctxRoot = mkdtempSync(join(tmpdir(), "ll-agent-ctx-"));
+    mkdirSync(join(ctxRoot, "agent-context"), { recursive: true });
+    writeFileSync(join(ctxRoot, "agent-context", "persona.md"), "BE HELPFUL");
+    configureWorkflowAssets({ builtInRoot: ctxRoot });
+
+    const { apis, created, secretsCreated } = fakeApis();
+    const sbx = new KubernetesSandbox(
+      {
+        taskId: "t1",
+        egress: { unrestricted: false, hosts: [] },
+        env: {},
+        stateDir: "/tmp",
+        timeoutSeconds: 60,
+      } as any,
+      cfg(apis),
+    );
+    await sbx.provision(pre as any);
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace/web" } as any,
+      () => {},
+    );
+
+    const promptSecret = secretsCreated.find((s: any) => s.metadata.name.endsWith("-prompt"));
+    expect(promptSecret.stringData.agents).toBe("BE HELPFUL");
+
+    const pod = created[0];
+    const promptVol = pod.spec.volumes.find((v: any) => v.name === "prompt");
+    expect(promptVol.secret.items).toEqual(
+      expect.arrayContaining([{ key: "agents", path: "AGENTS.md" }]),
+    );
+    const script: string = pod.spec.containers[0].command[2];
+    expect(script).toContain("if [ -f /lastlight/AGENTS.md ]; then cp /lastlight/AGENTS.md AGENTS.md; fi");
+  });
+
+  it("omits the agents key/mount item when no agent-context is configured", async () => {
+    ctxRoot = mkdtempSync(join(tmpdir(), "ll-agent-ctx-empty-"));
+    configureWorkflowAssets({ builtInRoot: ctxRoot }); // no agent-context/ subdir at all
+
+    const { apis, created, secretsCreated } = fakeApis();
+    const sbx = new KubernetesSandbox(
+      {
+        taskId: "t1",
+        egress: { unrestricted: false, hosts: [] },
+        env: {},
+        stateDir: "/tmp",
+        timeoutSeconds: 60,
+      } as any,
+      cfg(apis),
+    );
+    await sbx.provision(pre as any);
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace/web" } as any,
+      () => {},
+    );
+
+    const promptSecret = secretsCreated.find((s: any) => s.metadata.name.endsWith("-prompt"));
+    expect(promptSecret.stringData.agents).toBeUndefined();
+    const pod = created[0];
+    const promptVol = pod.spec.volumes.find((v: any) => v.name === "prompt");
+    expect(promptVol.secret.items).toEqual([{ key: "prompt", path: "prompt" }]);
   });
 });
 
