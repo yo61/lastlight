@@ -1,6 +1,6 @@
 # Handover — Kubernetes sandbox backend
 
-**Last updated:** 2026-07-25 · **Status:** Plan 5 (lifecycle/reclaim) complete + final-reviewed (opus, clean). Plans 3 (egress) cluster-validated under real enforcement; 4 (skills) final-reviewed. Plan 5 is local-only until pushed. Next: Plan 6 (concurrency/backpressure).
+**Last updated:** 2026-07-27 · **Status:** Plan 6 (concurrency/quota-backpressure) complete + final-reviewed (opus, **Ready to merge**, no Critical/Important). Plans 3 (egress) cluster-validated under real enforcement; 4 (skills) + 5 (lifecycle) + 6 final-reviewed clean. Plan 6 (range `b677f70..c362a3f`, 8 commits incl. the plan doc) is **local-only** until pushed. Next: **Plan 7 (Flux manifests)** — the last plan; turns on the ResourceQuota (+ egress/`toEndpoints`/reclaim RBAC) so backpressure, egress, and reclaim all enforce end-to-end, and deploys the harness in-cluster so the Plan-4 skill fetch validates.
 
 ## TL;DR
 
@@ -10,11 +10,11 @@ contribution. It runs each workflow phase as its own Pod (create → wait-for-st
 → stream JSONL → reap) behind the existing `Sandbox` port, instead of the
 in-process QEMU (`gondolin`) backend.
 
-- **Plans 1 + 2 + 3 (egress) + 4 (skills) DONE. Plan 5 (lifecycle/reclaim) DONE + final-reviewed (opus, clean).**
-- Branch: **`feat/k8s-sandbox-backend`** — Plan-4 pushed to the fork; **Plan-5 range `9509313..464bf68`** (8 commits incl. the plan doc), **local-only** — push with `git push origin feat/k8s-sandbox-backend`.
-- **Roadmap SPLIT TWICE** (Robin's calls): first "Plan 3 = egress + skills" → egress(3)+skills(4); then "Plan 5 = lifecycle + concurrency" → lifecycle(5)+concurrency(6). So the roadmap is now **7 plans**: 1 skeleton, 2 creds, **3 egress ✓**, **4 skills ✓**, **5 lifecycle ✓**, 6 concurrency, 7 Flux. Any older "Plan 6 (Flux)" reference below now means **Plan 7**.
-- Next: **Plan 6 — concurrency / quota-backpressure** (§8): re-source the admission slot-signal from `countRunning < maxWorkflows` to "did the pod create succeed"; treat a `403 exceeded quota` as backpressure (run stays queued, retried on completion); keep an absurdly-high sanity fuse. Touches SHARED admission machinery (`src/workflows/admission.ts` `createAdmissionController`/`admitNext`, `src/workflows/simple.ts`'s `countRunning >= maxWorkflows` gate) with a k8s-specific branch. Its enforcement validation is gated on **Plan 7**'s Flux `ResourceQuota` (build+unit-tested until then, like Plan 3's egress). Then **Plan 7 = Flux manifests** (Namespace/SA/Role/RoleBinding/ResourceQuota + harness Deployment SA) — turns on egress + `toEndpoints` + reclaim-RBAC enforcement AND makes the harness reachable in-cluster so the Plan-4 skill fetch validates end-to-end.
-- Plan docs: `plan-2-…`, `plan-3-egress.md`, `plan-4-skills.md`. SDD ledgers are per-plan: `.superpowers/sdd/plan-4-skills/progress.md` (Plan 4 — per-task reviews, 6 fix-loop items, the final-review fix wave, deferred minors). Plan 3's is `.superpowers/sdd/plan-3-egress/progress.md`; Plan 2's is the old flat `.superpowers/sdd/progress.md`.
+- **Plans 1 + 2 + 3 (egress) + 4 (skills) + 5 (lifecycle) DONE. Plan 6 (concurrency/quota-backpressure) DONE + final-reviewed (opus, Ready to merge, no Critical/Important).**
+- Branch: **`feat/k8s-sandbox-backend`** — Plan-4 pushed to the fork; **Plan-5 range `9509313..464bf68`** + **Plan-6 range `b677f70..c362a3f`** (8 commits incl. the plan doc), **local-only** — push with `git push origin feat/k8s-sandbox-backend`.
+- **Roadmap SPLIT TWICE** (Robin's calls): first "Plan 3 = egress + skills" → egress(3)+skills(4); then "Plan 5 = lifecycle + concurrency" → lifecycle(5)+concurrency(6). So the roadmap is **7 plans**: 1 skeleton, 2 creds, **3 egress ✓**, **4 skills ✓**, **5 lifecycle ✓**, **6 concurrency ✓**, 7 Flux. **Only Plan 7 remains.**
+- Next: **Plan 7 — Flux manifests** (`flux-homelab`): Namespace/SA/Role/RoleBinding/**ResourceQuota** + harness Deployment SA. Turns on egress + `toEndpoints` + reclaim-RBAC **and** the ResourceQuota enforcement (so Plan 6's backpressure enforces end-to-end, not just build+unit-tested), AND makes the harness reachable in-cluster so the Plan-4 skill fetch validates end-to-end. This is a `flux-homelab` manifest plan (hand-reviewed privilege — RBAC), not a `lastlight` code plan.
+- Plan docs: `plan-2-…` … `plan-6-concurrency.md`. SDD ledgers are per-plan: `.superpowers/sdd/plan-6-concurrency/progress.md` (Plan 6 — per-task reviews, the one Task-5 fix, plan corrections during execution, deferred minors). Plan 5's is `.superpowers/sdd/plan-5-lifecycle/progress.md`; Plan 4's `plan-4-skills/`; Plan 3's `plan-3-egress/`; Plan 2's is the old flat `.superpowers/sdd/progress.md`.
 
 ## Plan 2 — what landed + open follow-ups (tracked, deliberately deferred)
 
@@ -56,20 +56,31 @@ Scope was **§6 lifecycle only** (concurrency split out to Plan 6). A single ide
 - **Parked minors** (safe-to-defer — see `.superpowers/sdd/plan-5-lifecycle/progress.md`): no shared `MANAGED_BY` label constant (duplicated across pod/pvc/secret/reclaim); a reap-on-success trigger for ephemeral PVCs (currently only the Pod is disposed on success; the PVC waits for the sweep — bounded but asymmetric with the host reap-on-completion) — worth a Plan 6/7 look.
 - **Reclaim IS cluster-validatable now** (create Pods/PVCs as admin, reclaim by run + verify live-skip) — the opt-in `RUN_K8S_IT` Plan 5 block (`kubernetes.integration.test.ts`) does exactly that. **Robin: heads-up — Case B's cleanup sweep vacuums ALL idle PVCs in `lastlight-sandboxes`, so a repeated IT run also clears leftover Plan 1–4 PVCs in that namespace.**
 
+## Plan 6 — what landed + open follow-ups (concurrency/quota-backpressure; final review Ready-to-merge)
+
+Scope was **§8 concurrency only**. The k8s backend now defers concurrency to the cluster `ResourceQuota` instead of the app-level `maxWorkflows`. The chain (server-side only — **zero `packages/workflow-engine` edits**, dep invariant verified): a pod-create `403 exceeded quota` → **`QuotaExceededError`** (`k8s/quota.ts` `isQuotaExceeded` = 403 + `/exceeded quota/i`; wired into `createPodOrCleanupSecrets`, rethrows every other error incl. RBAC-403) → the orchestrator's catch stamps **`stopReason: "error_quota"`** (agent path reuses the converged catch; the command path got a **new** try/catch that maps only quota + rethrows real bash/script failures) → the runner's **per-run** agent/command port wrapper (no cross-run leak) flags it → `runWorkflow` returns **`WorkflowResult & { backpressure: true }`** (a server-side intersection; engine type untouched) → `simple.ts`/`resume.ts` call **`requeueRunning(id)`** (new store CAS `running→queued` + re-stamp clock) instead of `finishRun("failed")` → the **`AdmissionController` backpressure mode** (`K8S_SANITY_FUSE = 1000` gate, **one-probe-per-`admitNext`**) promotes it again as capacity frees. Dispatch on k8s admits freely (fuse, not `maxWorkflows`); the dispatch `finally` skips the event-driven `admitNext` on a backpressure requeue. Opus final review: **Ready to merge, no Critical/Important** — verified the loop is *paced not hot* (`resumeSimpleRun` never calls `admitNext`, so a re-quota'd promoted run is retried only by the 15 s sweep), non-k8s behavior byte-identical, `error_quota` is a **hard** stopReason (not caught by the soft-retry loops → no double-handling), mid-run resume preserves context/ledger.
+
+- **Enforcement is build+unit-tested until Plan 7.** The real `ResourceQuota` (and the harness SA's RBAC to see quota rejections under a live quota) lands with Plan 7's Flux manifests — same "validated by construction, enforced after Flux" posture as Plan 3's egress. The opt-in `RUN_K8S_IT` Plan 6 block (`kubernetes.integration.test.ts`) validates the mechanism NOW by staging a `pods:1` `ResourceQuota` via **admin** creds (harness SA can't until Plan 7), filling the slot, asserting the 2nd `runCommand` `rejects.toBeInstanceOf(QuotaExceededError)`, then deleting the quota (self-cleaning `finally`). **Robin: run it with `RUN_K8S_IT=1 … kubernetes.integration.test.ts` under `admin@homelab` — it needs admin to create the quota, and a crashed run could leave a `pods:1` quota wedging the namespace (the `finally` deletes it in the normal path).**
+- **Sanity fuse is a hardcoded constant, not config** (`K8S_SANITY_FUSE = 1000` in `admission.ts`) — design §8 "not a tuned number", like the workflow engine's 1000-agent cap. Scaling k8s concurrency is a one-line Flux `ResourceQuota` edit; the app never caps below the fuse.
+- **One-probe-per-tick** paces backlog drain to the ~15 s sweep cadence after capacity opens (plus each real completion promotes one). Acceptable for a homelab; revisit only if throughput demands it.
+- **Deferred minors** (all triaged safe-to-defer by the final review — see `.superpowers/sdd/plan-6-concurrency/progress.md`): `quota.test.ts` uses a relative import vs the `#src/` alias; `isQuotaExceeded`'s dual-read (`body.message` vs `err.message`) is untested (the `apiErr` helper sets both identically — a 2-line follow-up test would harden it); the `simple-cap` "admits freely" test asserts only `result.queued` falsy; the k8s fuse-hit notify says "concurrency limit (N)" (cosmetic — only fires at 1000 concurrent). None block merge.
+- **Docs:** the spec edits (`spec/09-sandbox.md` new **partial** k8s "Concurrency" subsection; `spec/06-workflow-engine.md` `backpressure`/`running→queued` note) are minimal and flagged in-development — the **full docs-sync stays deferred to branch-finish** (Plan 7, when the backend is reachable), consistent with Plans 2–5.
+
 ## Resume the AI session (paste to a fresh Claude)
 
-> Resume the k8s sandbox backend work. Read, in this repo:
-> `docs/plans/kubernetes-sandbox-backend/HANDOVER.md`, `design.md` (esp. §8 concurrency),
-> and `.superpowers/sdd/plan-5-lifecycle/progress.md`. Plans 1–5 are complete (5 =
-> lifecycle/reclaim, final-reviewed clean); the roadmap was split so concurrency is now
-> **Plan 6**. Write **Plan 6 (concurrency / quota-backpressure)** with the
-> `superpowers:writing-plans` skill (re-source the admission slot-signal from
-> `countRunning < maxWorkflows` to "did the pod create succeed"; treat `403 exceeded
-> quota` as backpressure → requeue + retry on completion; keep an absurdly-high sanity
-> fuse; it touches the SHARED `src/workflows/admission.ts` + `simple.ts` admission
-> machinery with a k8s branch), then execute it with
-> `superpowers:subagent-driven-development`, same as Plans 1–5. We're on branch
-> `feat/k8s-sandbox-backend`.
+> Resume the k8s sandbox backend work — **only Plan 7 (the final plan) remains.** Read, in this repo:
+> `docs/plans/kubernetes-sandbox-backend/HANDOVER.md`, `design.md` (esp. "Flux-managed manifests"
+> + the security posture), and `.superpowers/sdd/plan-6-concurrency/progress.md`. Plans 1–6 are
+> complete + final-reviewed clean (6 = concurrency/quota-backpressure). **Plan 7 = the Flux
+> manifests** for `flux-homelab` (Namespace/ServiceAccount/Role/RoleBinding/**ResourceQuota** +
+> the harness Deployment SA) that turn on, end-to-end: the `CiliumNetworkPolicy` egress +
+> `toEndpoints` skill-fetch rule (Plans 3/4), `reclaimSandbox` RBAC (Plan 5), and the k8s
+> `ResourceQuota` backpressure (Plan 6) — AND deploy the harness in-cluster so the Plan-4 skill
+> fetch validates from a real sandbox Pod. This is a **hand-reviewed privilege / manifest** plan
+> in the `flux-homelab` repo, not a `lastlight` code plan — brainstorm the RBAC surface first
+> (least-privilege: namespaced Role, the exact verbs each plan needs), then write it with
+> `superpowers:writing-plans`. We're on branch `feat/k8s-sandbox-backend` (local-only).
+> **Before merge:** run the `docs-sync` skill once the backend is reachable (the branch-finish gate).
 
 ## Key files
 
