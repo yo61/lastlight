@@ -606,8 +606,15 @@ describe("KubernetesSandbox (agent-context delivery — Plan 8 Task 5)", () => {
     expect(promptVol.secret.items).toEqual(
       expect.arrayContaining([{ key: "agents", path: "AGENTS.md" }]),
     );
+    // AGENTS.md must land at the workspace ROOT, never cwd-relative: a
+    // pre-cloned run's cwd is `WORKSPACE_DIR/<repo>` (the checkout root), so a
+    // cwd-relative copy would land INSIDE the repo tree and a repo-write
+    // phase's `git add -A && git commit` would commit the bot's AGENTS.md
+    // into the customer's PR.
     const script: string = pod.spec.containers[0].command[2];
-    expect(script).toContain("if [ -f /lastlight/AGENTS.md ]; then cp /lastlight/AGENTS.md AGENTS.md; fi");
+    expect(script).toContain(
+      "if [ -f /lastlight/AGENTS.md ]; then cp /lastlight/AGENTS.md /home/agent/workspace/AGENTS.md; fi",
+    );
   });
 
   it("omits the agents key/mount item when no agent-context is configured", async () => {

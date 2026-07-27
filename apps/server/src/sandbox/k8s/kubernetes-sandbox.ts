@@ -302,12 +302,22 @@ export class KubernetesSandbox implements Sandbox {
     // orchestrator.ts), so the resolved agent-context rides the same per-run
     // prompt Secret as an `agents` key, mounted at AGENT_CONTEXT_FILE. The
     // leading `cp` — a fixed, no-op-when-absent step — materializes it at
-    // `<cwd>/AGENTS.md` before agentic-pi starts, which reads it from cwd.
+    // `WORKSPACE_DIR/AGENTS.md`, the workspace ROOT, NOT cwd-relative: for a
+    // pre-cloned run `cwd` is `WORKSPACE_DIR/<repo>` (the checkout root), so a
+    // cwd-relative `AGENTS.md` would land INSIDE the repo tree and a
+    // repo-write phase's `git add -A && git commit` would commit the bot's
+    // AGENTS.md into the customer's PR (and clobber a repo that ships its
+    // own). Writing to the workspace root instead mirrors the host-shared
+    // backends exactly (`writeAgentsMd` writes to `prov.hostWorkspaceDir`, a
+    // sibling of the repo checkout, never inside it) — agentic-pi still finds
+    // it via its upward AGENTS.md walk from cwd. `WORKSPACE_DIR` is a fixed
+    // constant (not untrusted content), so interpolating it into the script
+    // text is safe.
     this.artifactToken = this.artifactStore.register(this.opts.taskId);
     const agentContext = loadAgentContext();
     const skillFlags = (opts.skillDirs ?? []).map((d) => `--skill ${d}`).join(" ");
     const script =
-      `if [ -f ${AGENT_CONTEXT_FILE} ]; then cp ${AGENT_CONTEXT_FILE} AGENTS.md; fi\n` +
+      `if [ -f ${AGENT_CONTEXT_FILE} ]; then cp ${AGENT_CONTEXT_FILE} ${WORKSPACE_DIR}/AGENTS.md; fi\n` +
       `agentic-pi run --model "$1" --sandbox none --no-session ${skillFlags} ` +
       `< ${PROMPT_FILE} ; rc=$?\n` +
       `if [ -d .lastlight ]; then\n` +
