@@ -20,6 +20,7 @@ import { runWorkflowCore } from "lastlight-workflow-engine";
 import type {
   EnginePorts,
   EngineSpan,
+  ExecutionResult,
   ObservabilityPort,
   PhaseReporter,
   PhaseResolver,
@@ -137,12 +138,8 @@ export function gitSandboxAccessForWorkflow(
 //
 // Thin delegations to the real app functions; injected into the engine so the
 // core stays domain-agnostic. Built once at module load (they hold no run
-// state) except the post-review handler, which is per-run.
-
-const defaultAgentPort: EnginePorts["agent"] = {
-  runAgent: (prompt, config, opts) => executeAgent(prompt, config, opts),
-  runCommand: (spec, config, opts) => executeCommand(spec, config, opts),
-};
+// state) except the post-review handler and the agent/command port (both
+// per-run — the latter closes over a per-run quota-detection flag, below).
 
 const defaultAssetLoader: EnginePorts["assets"] = {
   loadPromptTemplate: (relativePath) => loadPromptTemplate(relativePath),
@@ -191,7 +188,7 @@ export async function runWorkflow(
   approvalConfig?: ApprovalGateConfig,
   workflowId?: string,
   variants?: VariantConfig,
-): Promise<WorkflowResult> {
+): Promise<WorkflowResult & { backpressure?: boolean }> {
   const outputs: Record<string, unknown> = {};
   const { taskId } = ctx;
   // Slack-originated runs carry an explicit `slack:` trigger id — everything
@@ -373,8 +370,23 @@ export async function runWorkflow(
     gateEnabled,
   };
 
+  // Backpressure detection: a phase whose ExecutionResult carries
+  // `stopReason: "error_quota"` means the k8s ResourceQuota rejected its pod
+  // (design.md §8). We flag the run so the terminal handler requeues instead of
+  // failing. The engine (runWorkflowCore) stays backend-agnostic — this lives
+  // entirely in the server-owned port wrapper.
+  const quota = { hit: false };
+  const noteStopReason = (r: ExecutionResult): ExecutionResult => {
+    if (r.stopReason === "error_quota") quota.hit = true;
+    return r;
+  };
+  const agentPort: EnginePorts["agent"] = {
+    runAgent: (prompt, cfg, opts) => executeAgent(prompt, cfg, opts).then(noteStopReason),
+    runCommand: (spec, cfg, opts) => executeCommand(spec, cfg, opts).then(noteStopReason),
+  };
+
   const ports: EnginePorts = {
-    agent: defaultAgentPort,
+    agent: agentPort,
     assets: defaultAssetLoader,
     liveness: dockerLivenessPort,
     observability: telemetryObservability,
@@ -384,7 +396,7 @@ export async function runWorkflow(
     ]),
   };
 
-  return runWorkflowCore(runScope, {
+  const result = await runWorkflowCore(runScope, {
     reporter: phaseReporter,
     resolver: phaseResolver,
     ports,
@@ -392,4 +404,5 @@ export async function runWorkflow(
     reporterActive: !!reporter,
     capabilities: { qaImageAvailable, qaImageName: SANDBOX_IMAGE_QA },
   }, outputs);
+  return quota.hit ? { ...result, backpressure: true } : result;
 }

@@ -11,6 +11,7 @@ import {
   type WorkflowResult,
 } from "./runner.js";
 import { PhaseRef } from "./phase-ref.js";
+import { K8S_SANITY_FUSE } from "./admission.js";
 import type { TemplateContext } from "./templates.js";
 import { slugify } from "./templates.js";
 import { wrapUntrusted } from "../engine/screen/screen.js";
@@ -234,7 +235,7 @@ export async function runSimpleWorkflow(
   bootstrapLabel = "lastlight:bootstrap",
   variants?: VariantConfig,
   concurrency?: { maxWorkflows: number; maxQueueWaitMs: number },
-): Promise<WorkflowResult> {
+): Promise<WorkflowResult & { backpressure?: boolean }> {
   // Kill switch — if an admin has disabled this workflow in the dashboard,
   // skip every trigger source (cron, webhooks, mentions, Slack) without
   // creating a workflow_runs row. Returning success=true keeps callers
@@ -329,7 +330,13 @@ export async function runSimpleWorkflow(
       buildAssetIssueKey(workflowName, number, workflowId),
       !!effectivePrePopulateBranch,
     );
-    const overCap = concurrency !== undefined && db.runs.countRunning() >= concurrency.maxWorkflows;
+    // Concurrency authority differs by backend: docker/gondolin use the tuned
+    // app-level `maxWorkflows`; the k8s backend defers to the namespace
+    // ResourceQuota (design.md §8) and keeps only an absurdly-high sanity fuse,
+    // so it admits freely here and requeues later if a pod-create is quota-rejected.
+    const admitCap =
+      config.sandbox === "kubernetes" ? K8S_SANITY_FUSE : concurrency?.maxWorkflows ?? Infinity;
+    const overCap = db.runs.countRunning() >= admitCap;
     const runStatus: "running" | "queued" = overCap ? "queued" : "running";
     db.runs.createRun({
       id: workflowId,
@@ -359,9 +366,14 @@ export async function runSimpleWorkflow(
     });
     console.log(`[simple] Created workflow run ${workflowId} (${workflowName}) status=${runStatus}`);
     if (overCap) {
+      // On k8s the cap is the runaway-loop sanity fuse (the ResourceQuota is the
+      // real authority), not a tuned concurrency limit — word it accurately.
+      const capReason =
+        config.sandbox === "kubernetes"
+          ? `the safety fuse (${admitCap}) is reached`
+          : `the concurrency limit (${admitCap}) is reached`;
       await notify(
-        `\`${workflowName}\` is queued — the concurrency limit` +
-        ` (${concurrency!.maxWorkflows}) is reached.` +
+        `\`${workflowName}\` is queued — ${capReason}.` +
         ` It'll start automatically when a slot frees.`,
       );
       return { success: true, queued: true, phases: [] };
@@ -540,6 +552,14 @@ export async function runSimpleWorkflow(
     if (result.success && !result.paused) {
       db.runs.finishRun(workflowId, "succeeded");
       reapOnSuccess(workflowName, taskId, config);
+    } else if (result.backpressure) {
+      // k8s ResourceQuota rejected a pod-create: requeue, don't fail. The
+      // AdmissionController promotes it again as capacity frees (design.md §8).
+      db.runs.requeueRunning(workflowId);
+      await notify(
+        `\`${workflowName}\` is waiting for cluster capacity — it'll start automatically when a slot frees.`,
+      );
+      return { success: true, queued: true, backpressure: true, phases: result.phases };
     } else if (!result.success && !result.paused) {
       db.runs.finishRun(workflowId, "failed", {
         error: result.phases.find((p) => !p.success)?.error || "workflow failed",
