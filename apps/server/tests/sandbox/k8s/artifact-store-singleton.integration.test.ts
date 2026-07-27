@@ -22,7 +22,7 @@
  * Pod's exit hook actually curling a deployed harness) is exercised by the
  * opt-in `RUN_K8S_IT` case in `kubernetes.integration.test.ts`.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,6 +30,7 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import { artifactStore } from "#src/sandbox/artifact-store.js";
 import { mountArtifactUpload } from "#src/sandbox/k8s/artifact-upload-route.js";
+import { resetRuntimeConfigForTests } from "#src/config/config.js";
 
 /** Stage `entries` under a scratch dir and tar the `.lastlight` subtree via
  *  system `tar` — the same shape the in-pod upload script produces
@@ -54,7 +55,18 @@ describe("artifactStore singleton (in-process round-trip)", () => {
   const originalStateDir = process.env.STATE_DIR;
   let stateDir: string | undefined;
 
+  beforeEach(() => {
+    // The singleton's `rootFor` reads `getRuntimeConfig()?.sandboxDir` first and
+    // only falls back to `$STATE_DIR/sandboxes` when it's undefined. In the full
+    // suite another test may have left a runtime config loaded (pointing
+    // `sandboxDir` elsewhere), which would make this test's `STATE_DIR` pin a
+    // no-op and land the upload at an unrelated (possibly unwritable) path. Reset
+    // it so the fallback is deterministic and this test controls where bytes land.
+    resetRuntimeConfigForTests();
+  });
+
   afterEach(() => {
+    resetRuntimeConfigForTests();
     if (stateDir) rmSync(stateDir, { recursive: true, force: true });
     stateDir = undefined;
     if (originalStateDir === undefined) delete process.env.STATE_DIR;
