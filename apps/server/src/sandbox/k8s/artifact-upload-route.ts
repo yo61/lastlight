@@ -30,6 +30,11 @@ export function mountArtifactUpload(app: Hono, store: ArtifactStore): void {
       return c.body(null, 204);
     } catch (err) {
       if (err instanceof ArtifactTooLarge) return c.body(null, 413);
+      // Never swallow the cause: surface it so a malformed bundle vs a broken
+      // extraction is diagnosable in the harness log, not an opaque 400.
+      console.error(
+        `[artifact-upload] unpack failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`,
+      );
       // traversal / malformed tar → 400
       return c.body(null, 400);
     }
