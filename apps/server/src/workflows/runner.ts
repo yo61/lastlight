@@ -32,6 +32,7 @@ import type {
 } from "lastlight-workflow-engine";
 import { makePostReviewHandler } from "./handlers/post-review.js";
 import { fileVerdictReader } from "./handlers/verdict-reader.js";
+import { QuotaExceededError } from "../sandbox/k8s/quota.js";
 import type { ProgressReporter } from "../notify/types.js";
 import { collapseDetail } from "../notify/render.js";
 
@@ -380,9 +381,20 @@ export async function runWorkflow(
     if (r.stopReason === "error_quota") quota.hit = true;
     return r;
   };
+  // A quota rejection usually surfaces as a resolved `error_quota` ExecutionResult
+  // (noteStopReason above), but on some paths it propagates as a THROWN
+  // QuotaExceededError — the `.then` is skipped, so flag it here too. Re-throw so
+  // the phase still fails; the run is converted to backpressure (requeue) at the
+  // return AND the catch below, both gated on `quota.hit`.
+  const flagQuotaThrow = (err: unknown): never => {
+    if (err instanceof QuotaExceededError) quota.hit = true;
+    throw err;
+  };
   const agentPort: EnginePorts["agent"] = {
-    runAgent: (prompt, cfg, opts) => executeAgent(prompt, cfg, opts).then(noteStopReason),
-    runCommand: (spec, cfg, opts) => executeCommand(spec, cfg, opts).then(noteStopReason),
+    runAgent: (prompt, cfg, opts) =>
+      executeAgent(prompt, cfg, opts).then(noteStopReason).catch(flagQuotaThrow),
+    runCommand: (spec, cfg, opts) =>
+      executeCommand(spec, cfg, opts).then(noteStopReason).catch(flagQuotaThrow),
   };
 
   const ports: EnginePorts = {
@@ -396,13 +408,26 @@ export async function runWorkflow(
     ]),
   };
 
-  const result = await runWorkflowCore(runScope, {
-    reporter: phaseReporter,
-    resolver: phaseResolver,
-    ports,
-    store: db,
-    reporterActive: !!reporter,
-    capabilities: { qaImageAvailable, qaImageName: SANDBOX_IMAGE_QA },
-  }, outputs);
-  return quota.hit ? { ...result, backpressure: true } : result;
+  try {
+    const result = await runWorkflowCore(runScope, {
+      reporter: phaseReporter,
+      resolver: phaseResolver,
+      ports,
+      store: db,
+      reporterActive: !!reporter,
+      capabilities: { qaImageAvailable, qaImageName: SANDBOX_IMAGE_QA },
+    }, outputs);
+    return quota.hit ? { ...result, backpressure: true } : result;
+  } catch (err) {
+    // A hard phase failure — notably a single-phase workflow (e.g. issue-triage)
+    // whose only phase fails — throws OUT of the engine, bypassing the quota.hit
+    // check above. `noteStopReason` already flagged quota.hit on the resolved
+    // `error_quota` result, so convert it to backpressure here too — otherwise
+    // the run terminal-fails red instead of requeuing. Every other error (a real
+    // failure) propagates unchanged.
+    if (quota.hit || err instanceof QuotaExceededError) {
+      return { success: false, phases: [], backpressure: true };
+    }
+    throw err;
+  }
 }
