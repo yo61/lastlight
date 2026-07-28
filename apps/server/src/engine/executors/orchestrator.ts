@@ -271,7 +271,9 @@ export async function runSandboxedAgent(
         "workflow.name": config.telemetry?.workflowName,
         "phase.name": config.telemetry?.phaseName,
       };
-      recordError("agent", err, tags);
+      // A quota rejection is backpressure, not an error — don't pollute the
+      // error telemetry with it (the run requeues; see the outer .catch).
+      if (!(err instanceof QuotaExceededError)) recordError("agent", err, tags);
       recordExecutionMetrics("agent", { ...tags, durationMs });
       tree.end();
       const synthesizedId = await shim
@@ -344,6 +346,24 @@ export async function runSandboxedAgent(
         : {}),
     });
     return finalResult;
+  }).catch((err: unknown): ExecutionResult => {
+    // A ResourceQuota rejection during PROVISIONING (pod-create) throws OUTSIDE
+    // the in-callback runAgent catch above — `withSandbox` provisions before it
+    // runs `fn`. Surface it as an error_quota RESULT (not a throw) so the runner
+    // flags backpressure and requeues, instead of the run terminal-failing red.
+    // Mirrors runSandboxedCommand's outer catch; every other provision failure
+    // propagates unchanged (withSandbox already disposed).
+    if (err instanceof QuotaExceededError) {
+      return {
+        success: false,
+        output: "",
+        turns: 0,
+        error: err.message,
+        durationMs: Date.now() - startTime,
+        stopReason: "error_quota",
+      };
+    }
+    throw err;
   });
 }
 
