@@ -14,6 +14,22 @@ export const PROMPT_FILE = `${PROMPT_MOUNT_DIR}/prompt`;
  *  none/smol), so it rides the pod instead. */
 export const AGENT_CONTEXT_FILE = `${PROMPT_MOUNT_DIR}/AGENTS.md`;
 
+/**
+ * Resource *requests* (no limits) stamped on every sandbox container so the pod
+ * declares a footprint the scheduler can bin-pack and a compute `ResourceQuota`
+ * (`requests.cpu` / `requests.memory`) can meter. Requests only — deliberately
+ * no limits, so a heavy clone/build isn't CPU-throttled or OOM-killed. The
+ * per-namespace concurrency ceiling stays the `ResourceQuota`'s job (design.md
+ * §8), not a per-pod cap.
+ *
+ * The `agent` container carries the real workload; init containers (clone /
+ * skills) are short and light. Under quota accounting a pod's effective request
+ * per resource is `max(largest init container, sum of app containers)`, so the
+ * smaller init requests never inflate the pod's metered cost above the agent's.
+ */
+export const SANDBOX_AGENT_REQUESTS = { cpu: "250m", memory: "512Mi" } as const;
+export const SANDBOX_INIT_REQUESTS = { cpu: "100m", memory: "128Mi" } as const;
+
 /** Label stamping a sandbox Pod/PVC with the run that owns it — the selector
  *  `reclaimSandbox` (Plan 5) matches on to find a run's objects. `pvc.ts`
  *  reuses this same constant so both objects carry an identical key. */
@@ -125,6 +141,7 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
             initContainers: i.initContainers.map((c) => ({
               ...c,
               envFrom: [{ secretRef: { name: i.envFromSecret } }],
+              resources: { requests: { ...SANDBOX_INIT_REQUESTS } },
             })),
           }
         : {}),
@@ -134,6 +151,7 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
           image: i.image,
           command: i.command,
           workingDir: i.cwd,
+          resources: { requests: { ...SANDBOX_AGENT_REQUESTS } },
           // env now arrives from the per-run creds Secret — never inline (kubectl-visible).
           envFrom: [{ secretRef: { name: i.envFromSecret } }],
           volumeMounts: [

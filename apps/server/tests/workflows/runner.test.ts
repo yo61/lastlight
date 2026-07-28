@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { AgentWorkflowDefinition } from "#src/workflows/schema.js";
 import type { TemplateContext } from "#src/workflows/templates.js";
 import type { RunnerCallbacks, ApprovalGateConfig } from "#src/workflows/runner.js";
-import type { StateDb } from "#src/state/db.js";
+import { StateDb } from "#src/state/db.js";
 import type { ProgressReporter, ProgressModel, ProgressStep, StepStatus } from "#src/notify/types.js";
 
 // Mock the executor so we don't make real agent calls. `executeCommand` backs
@@ -322,6 +322,50 @@ describe("runWorkflow — backpressure", () => {
 
     const result = await runWorkflow(workflow, BASE_CTX, {} as never, {});
     expect(result.backpressure).toBe(true);
+  });
+
+  it("leaves the run 'running' on backpressure so the caller can requeue it", async () => {
+    // Regression (the root cause #8/#11 missed): `failWorkflow` used to flip the
+    // run to `failed` before `simple.ts`/`resume.ts` reacted to `backpressure` —
+    // and `requeueRunning` is CAS-guarded on `status = 'running'`, so the requeue
+    // then no-oped and the run stayed terminally `failed`. A quota rejection must
+    // leave the row `running` so the backpressure requeue can win. Uses a REAL
+    // store (not makeMockDb) so the finishRun/requeue ordering is observable.
+    const db = new StateDb(":memory:");
+    try {
+      db.runs.createRun({
+        id: "run-quota",
+        workflowName: "simple",
+        triggerId: "acme/widget#42",
+        currentPhase: "architect",
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      mockExecuteAgent.mockResolvedValue({
+        success: false,
+        output: "",
+        turns: 0,
+        durationMs: 1,
+        error: "pods is forbidden: exceeded quota: sandbox-quota",
+        stopReason: "error_quota",
+      });
+
+      const result = await runWorkflow(
+        SIMPLE_WORKFLOW,
+        BASE_CTX,
+        {} as never,
+        {},
+        db,
+        undefined,
+        undefined,
+        "run-quota",
+      );
+
+      expect(result.backpressure).toBe(true);
+      expect(db.runs.getRun("run-quota")?.status).toBe("running");
+    } finally {
+      db.close();
+    }
   });
 });
 

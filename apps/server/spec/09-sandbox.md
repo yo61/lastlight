@@ -199,9 +199,14 @@ or tunes its value:
   concurrency limit.
 - Each phase attempts its own Pod create. When the namespace
   `ResourceQuota` is full, the API server rejects the create with
-  `403 ... exceeded quota ...`; `KubernetesSandbox` maps that specific
-  rejection to a typed `QuotaExceededError` (`src/sandbox/k8s/quota.ts`),
-  distinct from every other create failure.
+  `403 ... exceeded quota ...` (or, for a compute quota the pod doesn't meter,
+  `403 ... failed quota: ... must specify ...`); `isQuotaExceeded`
+  (`src/sandbox/k8s/quota.ts`) matches both phrasings and `KubernetesSandbox`
+  maps the rejection to a typed `QuotaExceededError`, distinct from every other
+  create failure. Sandbox pods (and their init containers) declare CPU/memory
+  **requests** (no limits — `SANDBOX_AGENT_REQUESTS` / `SANDBOX_INIT_REQUESTS`
+  in `pod.ts`) so a compute `ResourceQuota` can meter them and the scheduler can
+  bin-pack; the per-namespace concurrency ceiling stays the quota's job.
 - The orchestrator (`src/engine/executors/orchestrator.ts`) catches
   `QuotaExceededError` and stamps the phase result
   `stopReason: "error_quota"` instead of failing the run.
@@ -215,6 +220,20 @@ or tunes its value:
   `db.runs.requeueRunning()`, flipping the run `running → queued` instead
   of `failed` — the run stays live and waits for a slot instead of
   terminating.
+  - **Ordering invariant.** The engine is backend-agnostic: on any phase
+    failure it calls the `failWorkflow` reporter port, which normally
+    finalizes the run `failed`. Because `requeueRunning` is CAS-guarded on
+    `status = 'running'`, that finalize MUST be suppressed for a backpressure
+    failure — otherwise the row is already `failed` when `simple.ts`/`resume.ts`
+    calls `requeueRunning`, the CAS matches nothing, and the run is stuck
+    `failed` instead of re-queued. `runner.ts` tracks a `quota.hit` flag (set
+    the moment a phase returns `error_quota` OR throws `QuotaExceededError`) and
+    makes both `failWorkflow` and the terminal `❌ failed` ping no-op while it
+    is set, so the run is left `running` for the requeue to win. The same
+    `runWorkflow` wrapper backs the fresh-dispatch and admission-drain
+    (`resume.ts`) paths, so both are covered. (This is the fail-flip #8/#11
+    missed: they converted the quota RESULT/THROW to backpressure but not the
+    `failWorkflow` finalize that ran first.)
 - The `AdmissionController` (`src/workflows/admission.ts`) runs in a
   **backpressure mode** for this backend
   (`backpressureMode: config.sandbox === "kubernetes"`): it gates
