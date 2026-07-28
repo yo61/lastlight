@@ -78,6 +78,24 @@ describe("buildPodManifest prompt mount", () => {
     expect(mount).toMatchObject({ mountPath: "/lastlight", readOnly: true });
   });
 
+  it("also projects the agents key as AGENTS.md when agentContextMount is set", () => {
+    const pod = buildPodManifest({
+      name: "ll-x", namespace: "lastlight-sandboxes", image: "img",
+      command: ["sh", "-c", "true"],
+      envFromSecret: "ll-x-creds", promptSecret: "ll-x-prompt", agentContextMount: true,
+      cwd: "/home/agent/workspace", activeDeadlineSeconds: 1800, runAsUser: 10001,
+      workspace: { kind: "emptyDir" }, egressPolicy: "strict",
+    });
+    const vol = pod.spec?.volumes?.find((v) => v.name === "prompt");
+    expect(vol?.secret).toMatchObject({
+      secretName: "ll-x-prompt",
+      items: [
+        { key: "prompt", path: "prompt" },
+        { key: "agents", path: "AGENTS.md" },
+      ],
+    });
+  });
+
   it("omits the prompt volume when no promptSecret is given (runCommand path)", () => {
     const pod = buildPodManifest({
       name: "ll-x", namespace: "lastlight-sandboxes", image: "img",

@@ -1,16 +1,19 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { PassThrough } from "node:stream";
 import { ApiException } from "@kubernetes/client-node";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KubernetesSandbox } from "#src/sandbox/k8s/kubernetes-sandbox.js";
+import { configureWorkflowAssets } from "#src/workflows/loader.js";
 import {
   STRICT_POLICY_NAME,
   OPEN_POLICY_NAME,
   EGRESS_POLICY_LABEL,
 } from "#src/sandbox/k8s/egress-policy.js";
 import { SkillBundleRegistry } from "#src/sandbox/k8s/skill-bundle.js";
+import { createArtifactStore, artifactStore as sharedArtifactStore } from "#src/sandbox/artifact-store.js";
+import { LocalArtifactBackend } from "#src/sandbox/artifact-backend.js";
 
 interface FakeOpts {
   /** The `V1Pod.status` object `readNamespacedPodStatus` returns. */
@@ -561,6 +564,90 @@ describe("KubernetesSandbox PVC workspace (pre-clone)", () => {
   });
 });
 
+describe("KubernetesSandbox (agent-context delivery — Plan 8 Task 5)", () => {
+  const pre = { owner: "acme", repo: "web", branch: "feature/x", token: "ghs_x" };
+  let ctxRoot: string;
+
+  afterEach(() => {
+    configureWorkflowAssets();
+    if (ctxRoot) rmSync(ctxRoot, { recursive: true, force: true });
+  });
+
+  it("delivers the resolved agent-context via the prompt Secret and copies it to AGENTS.md", async () => {
+    ctxRoot = mkdtempSync(join(tmpdir(), "ll-agent-ctx-"));
+    mkdirSync(join(ctxRoot, "agent-context"), { recursive: true });
+    writeFileSync(join(ctxRoot, "agent-context", "persona.md"), "BE HELPFUL");
+    configureWorkflowAssets({ builtInRoot: ctxRoot });
+
+    const { apis, created, secretsCreated } = fakeApis();
+    const sbx = new KubernetesSandbox(
+      {
+        taskId: "t1",
+        egress: { unrestricted: false, hosts: [] },
+        env: {},
+        stateDir: "/tmp",
+        timeoutSeconds: 60,
+      } as any,
+      cfg(apis),
+    );
+    await sbx.provision(pre as any);
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace/web" } as any,
+      () => {},
+    );
+
+    const promptSecret = secretsCreated.find((s: any) => s.metadata.name.endsWith("-prompt"));
+    expect(promptSecret.stringData.agents).toBe("BE HELPFUL");
+
+    const pod = created[0];
+    const promptVol = pod.spec.volumes.find((v: any) => v.name === "prompt");
+    expect(promptVol.secret.items).toEqual(
+      expect.arrayContaining([{ key: "agents", path: "AGENTS.md" }]),
+    );
+    // AGENTS.md must land at the workspace ROOT, never cwd-relative: a
+    // pre-cloned run's cwd is `WORKSPACE_DIR/<repo>` (the checkout root), so a
+    // cwd-relative copy would land INSIDE the repo tree and a repo-write
+    // phase's `git add -A && git commit` would commit the bot's AGENTS.md
+    // into the customer's PR.
+    const script: string = pod.spec.containers[0].command[2];
+    expect(script).toContain(
+      "if [ -f /lastlight/AGENTS.md ]; then cp /lastlight/AGENTS.md /home/agent/workspace/AGENTS.md; fi",
+    );
+  });
+
+  it("omits the agents key/mount item when no agent-context is configured", async () => {
+    ctxRoot = mkdtempSync(join(tmpdir(), "ll-agent-ctx-empty-"));
+    configureWorkflowAssets({ builtInRoot: ctxRoot }); // no agent-context/ subdir at all
+
+    const { apis, created, secretsCreated } = fakeApis();
+    const sbx = new KubernetesSandbox(
+      {
+        taskId: "t1",
+        egress: { unrestricted: false, hosts: [] },
+        env: {},
+        stateDir: "/tmp",
+        timeoutSeconds: 60,
+      } as any,
+      cfg(apis),
+    );
+    await sbx.provision(pre as any);
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace/web" } as any,
+      () => {},
+    );
+
+    const promptSecret = secretsCreated.find((s: any) => s.metadata.name.endsWith("-prompt"));
+    expect(promptSecret.stringData.agents).toBeUndefined();
+    const pod = created[0];
+    const promptVol = pod.spec.volumes.find((v: any) => v.name === "prompt");
+    expect(promptVol.secret.items).toEqual([{ key: "prompt", path: "prompt" }]);
+  });
+});
+
 describe("KubernetesSandbox (creds + workspace + prompt)", () => {
   const pre = { owner: "acme", repo: "web", branch: "feature/x", token: "ghs_x" };
 
@@ -608,9 +695,11 @@ describe("KubernetesSandbox (creds + workspace + prompt)", () => {
       });
       const command: string[] = pod.spec.containers[0].command;
       expect(command.join(" ")).toContain("< /lastlight/prompt");
-      // Model is its own trailing argv element, bound to `$1` at exec time —
-      // NOT interpolated into the script string (command[2]).
-      expect(command.at(-1)).toBe("anthropic/claude-sonnet-4-6");
+      // Model and the harness endpoint are their own trailing argv elements,
+      // bound to `$1`/`$2` at exec time — NOT interpolated into the script
+      // string (command[2]).
+      expect(command.at(-2)).toBe("anthropic/claude-sonnet-4-6");
+      expect(command.at(-1)).toBe("http://lastlight.lastlight.svc.cluster.local:8644");
       expect(command[2]).not.toContain("claude-sonnet-4-6");
 
       // ownerRefs patched (both secrets), each as a JSON-Patch "add" op.
@@ -769,4 +858,98 @@ describe("KubernetesSandbox skills staging", () => {
     expect(creds.stringData.LASTLIGHT_SKILL_TOKEN).toBeUndefined();
     expect(pod.spec.containers[0].command.join(" ")).not.toContain("--skill");
   });
+});
+
+describe("KubernetesSandbox artifact upload", () => {
+  it(
+    "runAgent mints an artifact token, injects it into creds, and appends a " +
+      "best-effort tar+curl upload that runs after the agent, evicted on dispose",
+    async () => {
+      const { apis, created, secretsCreated } = fakeApis();
+      const artifactStore = createArtifactStore(
+        new LocalArtifactBackend(() => "/tmp/artifact-test"),
+      );
+      const sbx = new KubernetesSandbox(
+        factoryOpts,
+        cfg(apis, { namespace: "ns-artifacts", artifactStore }),
+      );
+      await sbx.provision();
+
+      await sbx.runAgent(
+        "t1",
+        "hello",
+        { model: "anthropic/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace" } as any,
+        () => {},
+      );
+
+      const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
+      const token = creds.stringData.LASTLIGHT_ARTIFACT_TOKEN;
+      expect(token).toBeTruthy();
+      expect(artifactStore.resolve(token)).toBe("t1");
+
+      // Script no longer starts with a bare `exec` — a post-run upload step
+      // must run after the agent, so the agent's own exit code ($?) can be
+      // captured, then restored via the final `exit $rc`.
+      const script: string = created[0].spec.containers[0].command[2];
+      expect(script.trim().startsWith("exec ")).toBe(false);
+      expect(script).toContain("rc=$?");
+      expect(script).toContain("tar -czf - .lastlight");
+      expect(script).toContain("curl -sf -X POST");
+      expect(script).toContain("Authorization: Bearer $LASTLIGHT_ARTIFACT_TOKEN");
+      expect(script).toContain("$2/internal/sandbox-artifacts");
+      expect(script).toContain("|| true");
+      expect(script).toContain("exit $rc");
+
+      await sbx.dispose();
+      expect(artifactStore.resolve(token)).toBeUndefined();
+    },
+  );
+
+  it("runCommand mints no artifact token: no LASTLIGHT_ARTIFACT_TOKEN in creds", async () => {
+    const { apis, secretsCreated } = fakeApis();
+    const artifactStore = createArtifactStore(new LocalArtifactBackend(() => "/tmp/artifact-test"));
+    const sbx = new KubernetesSandbox(
+      factoryOpts,
+      cfg(apis, { namespace: "ns-artifacts-cmd", artifactStore }),
+    );
+    await sbx.provision();
+    await sbx.runCommand("t1", "true", { cwd: "/w", timeoutSeconds: 30 } as any);
+
+    const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
+    expect(creds.stringData.LASTLIGHT_ARTIFACT_TOKEN).toBeUndefined();
+  });
+
+  it(
+    "defaults to the module artifactStore singleton when none is injected — " +
+      "the same instance the /internal/sandbox-artifacts route resolves against",
+    async () => {
+      const { apis, secretsCreated } = fakeApis();
+      // No `artifactStore` override in these overrides — exercises the real
+      // default (`cfg.artifactStore ?? artifactStore` in kubernetes-sandbox.ts),
+      // which Task 6 points at the shared module singleton instead of a
+      // throwaway per-instance store.
+      const sbx = new KubernetesSandbox(factoryOpts, cfg(apis, { namespace: "ns-artifacts-default" }));
+      await sbx.provision();
+
+      await sbx.runAgent(
+        "t1",
+        "hello",
+        { model: "anthropic/x", sandboxEnv: {}, agentCwd: "/home/agent/workspace" } as any,
+        () => {},
+      );
+
+      const creds = secretsCreated.find((s: any) => s.metadata.name.endsWith("-creds"));
+      const token = creds.stringData.LASTLIGHT_ARTIFACT_TOKEN;
+      expect(token).toBeTruthy();
+      // Resolved via the imported singleton directly (not a fresh store) —
+      // if the adapter's default ever regresses back to a per-instance store,
+      // this resolves to `undefined` and the test fails. `register` keys on
+      // `this.opts.taskId` (the constructor's `factoryOpts.taskId`, "t1"),
+      // not the `taskId` arg passed to `runAgent`.
+      expect(sharedArtifactStore.resolve(token)).toBe("t1");
+
+      await sbx.dispose();
+      expect(sharedArtifactStore.resolve(token)).toBeUndefined();
+    },
+  );
 });

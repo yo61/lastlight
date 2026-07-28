@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ApiException } from "@kubernetes/client-node";
 import type { V1PersistentVolumeClaim } from "@kubernetes/client-node";
 import { KubernetesSandbox } from "#src/sandbox/k8s/kubernetes-sandbox.js";
@@ -23,6 +25,21 @@ const HARNESS_ENDPOINT = process.env.LASTLIGHT_K8S_HARNESS_ENDPOINT ??
   "http://lastlight.lastlight.svc.cluster.local:8644";
 const HARNESS_NAMESPACE = process.env.LASTLIGHT_K8S_HARNESS_NAMESPACE ?? "lastlight";
 const HARNESS_POD_LABELS = { "app.kubernetes.io/name": "lastlight" };
+
+/**
+ * Filesystem root where the ArtifactStore's `LocalArtifactBackend` writes,
+ * from the perspective of wherever THIS test process runs. In a real
+ * `RUN_K8S_IT` run, the sandbox Pod's exit hook uploads to the DEPLOYED
+ * harness at `HARNESS_ENDPOINT` — a different process from this test — so
+ * asserting on the uploaded file only works when this test's filesystem is
+ * the same one that harness writes to (run directly on the harness host, or
+ * over a shared NFS/PV mount). Override to whatever that shared root
+ * resolves to; the default mirrors the harness's own resolution
+ * (`getRuntimeConfig()?.sandboxDir ?? $STATE_DIR/sandboxes`, `STATE_DIR`
+ * defaulting to `./data`) and is very unlikely to be correct unmodified.
+ */
+const HARNESS_SANDBOX_DIR =
+  process.env.LASTLIGHT_K8S_HARNESS_SANDBOX_DIR ?? join(process.env.STATE_DIR || "data", "sandboxes");
 
 /** True once the strict CiliumNetworkPolicy has actually been applied in
  *  `namespace` — false when the apply 403'd (RBAC not yet granted, Plan 6)
@@ -220,6 +237,92 @@ describe.runIf(RUN)("KubernetesSandbox Plan 2 (integration)", () => {
           (e) => events.push(e),
         );
         expect(events.some((e) => e.type === "agent_end")).toBe(true);
+      } finally {
+        await sbx.dispose();
+      }
+    },
+    300_000,
+  );
+});
+
+describe.runIf(RUN)("KubernetesSandbox Plan 8 artifact-store (integration)", () => {
+  const mkSbx = (taskId: string, env: Record<string, string>) =>
+    new KubernetesSandbox(
+      {
+        taskId,
+        egress: { unrestricted: false, hosts: [] },
+        env,
+        stateDir: "/tmp",
+        timeoutSeconds: 300,
+      } as any,
+      {
+        namespace: process.env.LASTLIGHT_K8S_NAMESPACE ??
+          "lastlight-sandboxes",
+        image: IMAGE,
+        storageClassName: process.env.LASTLIGHT_K8S_STORAGE_CLASS ??
+          "truenas-iscsi",
+        workspaceSize: "2Gi",
+        runAsUser: parseInt(
+          process.env.LASTLIGHT_K8S_RUN_AS_USER ?? "10001",
+          10,
+        ),
+        harnessEndpoint: HARNESS_ENDPOINT,
+        harnessNamespace: HARNESS_NAMESPACE,
+        harnessPodLabels: HARNESS_POD_LABELS,
+      },
+    );
+
+  // Only `runAgent` mints an artifact token and appends the post-run
+  // tar+upload step (`runCommand` never uploads — nothing to upload), so this
+  // case needs a real AI call, same gate as the Plan 2 AI case above.
+  it.runIf(HAS_AI)(
+    "a real run's .lastlight/ findings upload round-trips to the harness host",
+    async () => {
+      const taskId = `it-artifact-${Date.now()}`;
+      const sbx = mkSbx(taskId, {
+        GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? "",
+        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY!,
+      });
+      const events: any[] = [];
+      try {
+        await sbx.provision({
+          owner: "octocat",
+          repo: "Hello-World",
+          branch: "master",
+          token: process.env.GITHUB_TOKEN ?? "",
+        } as any);
+        await sbx.runAgent(
+          taskId,
+          "Using your shell/bash tool, run exactly this one command and " +
+            "nothing else, then reply with exactly the word DONE: " +
+            "mkdir -p .lastlight/pr-review && printf '%s' " +
+            '\'{"skip":true,"summary":"k8s artifact-store IT","event":"COMMENT","findings":[]}\' ' +
+            "> .lastlight/pr-review/findings.json",
+          {
+            model: "anthropic/claude-haiku-4-5-20251001",
+            sandboxEnv: {},
+            agentCwd: "/home/agent/workspace/Hello-World",
+          } as any,
+          (e) => events.push(e),
+        );
+        expect(events.some((e) => e.type === "agent_end")).toBe(true);
+
+        // The pod's exit hook best-effort uploads `.lastlight/` right after
+        // the agent exits (`|| true` — never masks the agent's own exit
+        // code), so give the upload a moment to land before asserting.
+        const findingsPath = join(
+          HARNESS_SANDBOX_DIR,
+          taskId,
+          ".lastlight",
+          "pr-review",
+          "findings.json",
+        );
+        for (let attempt = 0; attempt < 10 && !existsSync(findingsPath); attempt++) {
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        expect(existsSync(findingsPath)).toBe(true);
+        const doc = JSON.parse(readFileSync(findingsPath, "utf8"));
+        expect(doc.summary).toBe("k8s artifact-store IT");
       } finally {
         await sbx.dispose();
       }

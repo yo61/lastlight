@@ -3,6 +3,7 @@ import type { ExecutorConfig } from "../engine/github/profiles.js";
 import type { StateDb, WorkflowRun, TriggerActorType } from "../state/db.js";
 import { getBotName, getRuntimeConfig, type ModelConfig, type VariantConfig } from "../config/config.js";
 import { reapSandboxWorkspace } from "../sandbox/reap.js";
+import { artifactStore } from "../sandbox/artifact-store.js";
 import { getWorkflow } from "./loader.js";
 import {
   runWorkflow,
@@ -121,6 +122,16 @@ export function workflowScopedTaskId(
  * is owned by the backstop TTL/LRU sweep, so re-review fanout keeps its warm
  * `node_modules`. Failures are left for the sweep too (post-mortem debugging).
  * Best-effort — never throws into the already-succeeded run.
+ *
+ * Also GCs the run's `.lastlight/` artifact-store namespace (Plan 8), but
+ * ONLY when the workspace dir was actually removed above — this runs well
+ * after `post-review` (the run has already finished), and the reuse/recreate
+ * early-return above means a per-target run (pr-review, pr-fix, build) skips
+ * gc here too, exactly like it skips the workspace reap: those artifacts stay
+ * on disk as part of the same warm cache. For the local backend this is
+ * redundant with the `rmSync` above (both remove the same on-disk tree); the
+ * real payoff is a future S3 backend, where `gc` is the only thing that
+ * reaches the remote objects.
  */
 export function reapOnSuccess(workflowName: string, taskId: string, config: ExecutorConfig): void {
   const rt = getRuntimeConfig();
@@ -129,11 +140,16 @@ export function reapOnSuccess(workflowName: string, taskId: string, config: Exec
     return;
   }
   try {
-    reapSandboxWorkspace({
+    const { removed } = reapSandboxWorkspace({
       taskId,
       stateDir: config.stateDir ?? rt?.stateDir ?? "data",
       sandboxDir: config.sandboxDir ?? rt?.sandboxDir,
     });
+    if (removed) {
+      artifactStore.gc(taskId).catch((err: unknown) => {
+        console.warn(`[reap] artifact gc failed for ${taskId}:`, err);
+      });
+    }
   } catch {
     /* best effort — a reap failure must not fail a successful run */
   }

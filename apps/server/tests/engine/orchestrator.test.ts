@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { executeAgent, executeCommand } from "#src/engine/agent-executor.js";
 import { FakeSandbox, type SandboxEvent } from "#src/sandbox/sandbox.js";
 import { QuotaExceededError } from "#src/sandbox/k8s/quota.js";
+import { configureWorkflowAssets } from "#src/workflows/loader.js";
 
 /** Poll a predicate for up to `timeoutMs` — the agent-path shim flushes its
  * jsonl fire-and-forget (`void shim.flush()`), so the write lands just after
@@ -303,6 +304,71 @@ describe("Sandbox orchestrator (FakeSandbox)", () => {
     const env = fake.receivedCommandOpts?.sandboxEnv;
     expect(env?.GIT_AUTHOR_NAME).toBe("last-light[bot]");
     expect(env?.GIT_COMMITTER_NAME).toBe("last-light[bot]");
+  });
+
+  describe("AGENTS.md host write (host-shared backends vs kubernetes)", () => {
+    let agentContextRoot: string;
+
+    beforeEach(() => {
+      agentContextRoot = mkdtempSync(join(tmpdir(), "ll-agent-ctx-"));
+      mkdirSync(join(agentContextRoot, "agent-context"), { recursive: true });
+      writeFileSync(join(agentContextRoot, "agent-context", "persona.md"), "BE HELPFUL");
+      configureWorkflowAssets({ builtInRoot: agentContextRoot });
+    });
+
+    afterEach(() => {
+      configureWorkflowAssets();
+      rmSync(agentContextRoot, { recursive: true, force: true });
+    });
+
+    it("writes AGENTS.md to the host workspace on a host-shared backend", async () => {
+      const fake = new FakeSandbox({ events: successEvents() });
+      // `dispose()` removes the fake host workspace dir once the run
+      // completes, so check the write while the sandbox is still live — the
+      // "session" event (first in successEvents()) fires from inside
+      // sandbox.runAgent(), after writeAgentsMd already ran.
+      let sawDuringRun: { exists: boolean; content: string } | undefined;
+      await executeAgent(
+        "do the thing",
+        { sandbox: "none", stateDir, sessionsDir },
+        {
+          sandboxFactory: fake.asFactory(),
+          onSessionId: () => {
+            const agentsMdPath = join(fake.hostWorkspaceDir, "AGENTS.md");
+            sawDuringRun = {
+              exists: existsSync(agentsMdPath),
+              content: existsSync(agentsMdPath) ? readFileSync(agentsMdPath, "utf8") : "",
+            };
+          },
+        },
+      );
+
+      expect(sawDuringRun?.exists).toBe(true);
+      expect(sawDuringRun?.content).toContain("BE HELPFUL");
+    });
+
+    it("skips the host AGENTS.md write on the kubernetes backend (no host-visible workspace)", async () => {
+      const fake = new FakeSandbox({ events: successEvents() });
+      // Same dispose-timing note as above: check DURING the run, not after —
+      // `dispose()` removes the whole fake host dir regardless of whether the
+      // write happened, so a post-run check would pass trivially either way.
+      let sawDuringRun: boolean | undefined;
+      await executeAgent(
+        "do the thing",
+        { sandbox: "kubernetes", stateDir, sessionsDir },
+        {
+          sandboxFactory: fake.asFactory(),
+          onSessionId: () => {
+            // FakeSandbox hands back a REAL host dir regardless of backend, so
+            // a write would succeed here if attempted — proving `false` below
+            // is a deliberate skip, not an ENOENT accident swallowed silently.
+            sawDuringRun = existsSync(join(fake.hostWorkspaceDir, "AGENTS.md"));
+          },
+        },
+      );
+
+      expect(sawDuringRun).toBe(false);
+    });
   });
 
   it("skips the session jsonl when writeSession is false", async () => {

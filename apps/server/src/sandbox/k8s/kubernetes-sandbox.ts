@@ -13,8 +13,10 @@ import type {
 } from "../sandbox.js";
 import { parseLine } from "../sandbox.js";
 import type { SandboxBackend } from "../../config/config.js";
+import { artifactStore, type ArtifactStore } from "../artifact-store.js";
+import { loadAgentContext } from "../../workflows/loader.js";
 import { makeK8sApis, type K8sApis } from "./client.js";
-import { buildPodManifest, WORKSPACE_DIR, PROMPT_FILE, type PodSpecInput } from "./pod.js";
+import { buildPodManifest, WORKSPACE_DIR, PROMPT_FILE, AGENT_CONTEXT_FILE, type PodSpecInput } from "./pod.js";
 import { podNameFor, sanitizeLabelValue } from "./naming.js";
 import { buildSecretManifest, podOwnerReference, secretNameFor } from "./secret.js";
 import { streamPodLog } from "./log-stream.js";
@@ -83,6 +85,11 @@ export interface K8sAdapterConfig {
   apis?: K8sApis;
   /** Injectable registry for tests; defaults to the module singleton skillBundleRegistry. */
   skillRegistry?: SkillBundleRegistry;
+  /** Injectable artifact store (tests only). Defaults to the module-wide
+   *  `artifactStore` singleton (`../artifact-store.js`) — the same instance
+   *  the `/internal/sandbox-artifacts` route resolves tokens against, so a
+   *  token this adapter registers is always resolvable by that route. */
+  artifactStore?: ArtifactStore;
 }
 
 /** Ensure the egress policy pair once per namespace per process. Keyed by
@@ -97,7 +104,11 @@ const egressEnsured = new Map<string, Promise<void>>();
  * handed a pre-clone descriptor (design B — the harness can't pre-clone
  * host-side, so an initContainer clones inside the pod) and falls back to an
  * ephemeral in-pod `emptyDir` otherwise. `runAgent` delivers the prompt via a
- * per-run prompt Secret mounted into the pod and piped to the agent's stdin.
+ * per-run prompt Secret mounted into the pod and piped to the agent's stdin;
+ * the resolved agent-context (persona/hard-rules) rides the same Secret as an
+ * `agents` key (Plan 8 Task 5 — the harness has no host-shared workspace to
+ * write AGENTS.md into on this backend), and the `runAgent` script copies it
+ * to `<cwd>/AGENTS.md` before the agent starts.
  * Both the creds and prompt Secrets are created BEFORE the Pod (a Pod whose
  * `envFrom`/volume mount names a missing Secret fails to start); once the Pod
  * exists, each Secret's `ownerReferences` is patched to the Pod's uid so
@@ -105,7 +116,12 @@ const egressEnsured = new Map<string, Promise<void>>();
  * directly as a backstop. `stageSkills` tars the resolved skill dirs and
  * registers the bundle with the (injectable) skill registry; `runPod` then
  * carries the fetch token into the creds Secret and adds a skills initContainer
- * that pulls it from the harness's `/internal/skill-bundle` route.
+ * that pulls it from the harness's `/internal/skill-bundle` route. `runAgent`
+ * additionally mints a per-run token from the (injectable) artifact store and
+ * carries it into the same creds Secret; the in-pod script tars `.lastlight/`
+ * after the agent finishes and uploads it to the harness's
+ * `/internal/sandbox-artifacts` route, best-effort so an upload hiccup never
+ * masks the agent's real exit code — `dispose` evicts the token afterward.
  */
 export class KubernetesSandbox implements Sandbox {
   readonly backend: SandboxBackend = "kubernetes";
@@ -130,6 +146,12 @@ export class KubernetesSandbox implements Sandbox {
    *  any — `runPod` needs it for the creds Secret + skills-init; `dispose`
    *  evicts it from the registry. */
   private skillToken?: string;
+  private readonly artifactStore: ArtifactStore;
+  /** Artifact-upload token minted by the last `runAgent()` call, if any —
+   *  `runPod` needs it for the creds Secret; the in-pod script reads it back
+   *  via env to authenticate the `.lastlight/` upload; `dispose` evicts it
+   *  from the store. Never minted for `runCommand` (nothing to upload). */
+  private artifactToken?: string;
 
   constructor(
     private readonly opts: SandboxFactoryOpts,
@@ -145,6 +167,7 @@ export class KubernetesSandbox implements Sandbox {
     this.harnessNamespace = cfg.harnessNamespace;
     this.harnessPodLabels = cfg.harnessPodLabels;
     this.skillRegistry = cfg.skillRegistry ?? skillBundleRegistry;
+    this.artifactStore = cfg.artifactStore ?? artifactStore;
   }
 
   async provision(pre?: PrePopulateSpec): Promise<ProvisionResult> {
@@ -257,24 +280,60 @@ export class KubernetesSandbox implements Sandbox {
   ): Promise<RunResult | undefined> {
     // The prompt reaches the container via a mounted Secret file (see
     // `runPod`'s `promptText`), piped to stdin — never as a CLI arg (`ps`
-    // -visible) or inline env. `opts.model` arrives as a positional arg to
-    // `sh`, NOT interpolated into the script text — the same
-    // command-injection class `init-clone.ts` guards against for
-    // owner/repo/branch: `sh -c SCRIPT sh <model>` binds argv to `$1` at exec
-    // time, immune to quote-breaking regardless of characters. Each skill dir
-    // is already `${SKILLS_MOUNT_DIR}/<sanitized-name>` (stageSkills), so
-    // splicing it into the script text is safe.
+    // -visible) or inline env. `opts.model` and the harness endpoint arrive
+    // as positional args to `sh`, NOT interpolated into the script text — the
+    // same command-injection class `init-clone.ts` guards against for
+    // owner/repo/branch: `sh -c SCRIPT sh <model> <endpoint>` binds argv to
+    // `$1`/`$2` at exec time, immune to quote-breaking regardless of
+    // characters. Each skill dir is already
+    // `${SKILLS_MOUNT_DIR}/<sanitized-name>` (stageSkills), so splicing it
+    // into the script text is safe.
+    //
+    // No longer a bare `exec`: the agent's real exit code is captured (`rc`)
+    // so a post-run step — a best-effort tar+upload of `.lastlight/` — can run
+    // AFTER the agent finishes, then `exit $rc` preserves the agent's own
+    // result. The upload never masks that result (`|| true`): a hiccup
+    // uploading artifacts must not turn a successful agent run into a
+    // reported failure. The token travels via env (`LASTLIGHT_ARTIFACT_TOKEN`,
+    // injected into the creds Secret below), never as a CLI arg.
+    //
+    // AGENTS.md (Plan 8 Task 5): the harness has no host-shared workspace to
+    // write it into on k8s (`writeAgentsMd` is skipped for this backend — see
+    // orchestrator.ts), so the resolved agent-context rides the same per-run
+    // prompt Secret as an `agents` key, mounted at AGENT_CONTEXT_FILE. The
+    // leading `cp` — a fixed, no-op-when-absent step — materializes it at
+    // `WORKSPACE_DIR/AGENTS.md`, the workspace ROOT, NOT cwd-relative: for a
+    // pre-cloned run `cwd` is `WORKSPACE_DIR/<repo>` (the checkout root), so a
+    // cwd-relative `AGENTS.md` would land INSIDE the repo tree and a
+    // repo-write phase's `git add -A && git commit` would commit the bot's
+    // AGENTS.md into the customer's PR (and clobber a repo that ships its
+    // own). Writing to the workspace root instead mirrors the host-shared
+    // backends exactly (`writeAgentsMd` writes to `prov.hostWorkspaceDir`, a
+    // sibling of the repo checkout, never inside it) — agentic-pi still finds
+    // it via its upward AGENTS.md walk from cwd. `WORKSPACE_DIR` is a fixed
+    // constant (not untrusted content), so interpolating it into the script
+    // text is safe.
+    this.artifactToken = this.artifactStore.register(this.opts.taskId);
+    const agentContext = loadAgentContext();
     const skillFlags = (opts.skillDirs ?? []).map((d) => `--skill ${d}`).join(" ");
     const script =
-      `exec agentic-pi run --model "$1" --sandbox none --no-session ${skillFlags} ` +
-      `< ${PROMPT_FILE}`;
+      `if [ -f ${AGENT_CONTEXT_FILE} ]; then cp ${AGENT_CONTEXT_FILE} ${WORKSPACE_DIR}/AGENTS.md; fi\n` +
+      `agentic-pi run --model "$1" --sandbox none --no-session ${skillFlags} ` +
+      `< ${PROMPT_FILE} ; rc=$?\n` +
+      `if [ -d .lastlight ]; then\n` +
+      `  tar -czf - .lastlight | curl -sf -X POST ` +
+      `-H "Authorization: Bearer $LASTLIGHT_ARTIFACT_TOKEN" ` +
+      `--data-binary @- "$2/internal/sandbox-artifacts" || true\n` +
+      `fi\n` +
+      `exit $rc`;
     await this.runPod({
       taskId,
-      command: ["sh", "-c", script, "sh", opts.model],
+      command: ["sh", "-c", script, "sh", opts.model, this.harnessEndpoint],
       env: { ...this.opts.env, ...opts.sandboxEnv },
       cwd: opts.agentCwd,
       onLine: parseLine(onEvent),
       promptText: prompt,
+      agentContext,
     });
     return undefined; // orchestrator reconstructs the result from the streamed events
   }
@@ -333,8 +392,12 @@ export class KubernetesSandbox implements Sandbox {
     /** Prompt text for a `runAgent` call — creates a prompt Secret mounted
      *  into the pod. Omitted for `runCommand` (no prompt to deliver). */
     promptText?: string;
+    /** Resolved agent-context for a `runAgent` call — rides the same prompt
+     *  Secret as an `agents` key (see AGENT_CONTEXT_FILE). Empty/omitted →
+     *  no key, no extra mount item; never set for `runCommand`. */
+    agentContext?: string;
   }): Promise<void> {
-    const { taskId, command, env, cwd, onLine, timeoutSeconds, promptText } = input;
+    const { taskId, command, env, cwd, onLine, timeoutSeconds, promptText, agentContext } = input;
     const name = podNameFor(taskId, "run");
     this.activePod = name;
     await this.ensureEgress();
@@ -344,12 +407,17 @@ export class KubernetesSandbox implements Sandbox {
     // Must be created BEFORE the pod: a pod whose envFrom names a missing
     // Secret fails to start. When `stageSkills` staged a bundle, its fetch
     // token rides along in the same map so the skills-init reads it via the
-    // same `envFrom` the main container gets.
+    // same `envFrom` the main container gets. Likewise the artifact-upload
+    // token minted by `runAgent` (never set for `runCommand` — nothing to
+    // upload) rides along so the in-pod script's post-run upload can
+    // authenticate.
     const credsName = secretNameFor(name, "creds");
     this.activeCredsSecret = credsName;
-    const credsData = this.skillToken
-      ? { ...env, LASTLIGHT_SKILL_TOKEN: this.skillToken }
-      : env;
+    const credsData = {
+      ...env,
+      ...(this.skillToken && { LASTLIGHT_SKILL_TOKEN: this.skillToken }),
+      ...(this.artifactToken && { LASTLIGHT_ARTIFACT_TOKEN: this.artifactToken }),
+    };
     await this.apis.core.createNamespacedSecret({
       namespace: this.ns,
       body: buildSecretManifest({
@@ -372,7 +440,7 @@ export class KubernetesSandbox implements Sandbox {
         body: buildSecretManifest({
           name: promptName,
           namespace: this.ns,
-          data: { prompt: promptText },
+          data: { prompt: promptText, ...(agentContext ? { agents: agentContext } : {}) },
           labels: { "lastlight.io/pod": name },
         }),
       });
@@ -416,6 +484,7 @@ export class KubernetesSandbox implements Sandbox {
       command,
       envFromSecret: credsName,
       promptSecret: promptName,
+      agentContextMount: Boolean(agentContext),
       cwd,
       activeDeadlineSeconds: timeoutSeconds ?? this.opts.timeoutSeconds ?? 1800,
       runAsUser: this.runAsUser,
@@ -639,6 +708,10 @@ export class KubernetesSandbox implements Sandbox {
     if (this.skillToken) {
       this.skillRegistry.evict(this.skillToken);
       this.skillToken = undefined;
+    }
+    if (this.artifactToken) {
+      this.artifactStore.evict(this.artifactToken);
+      this.artifactToken = undefined;
     }
   }
 }

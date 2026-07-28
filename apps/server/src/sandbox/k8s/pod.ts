@@ -5,6 +5,15 @@ import { SKILLS_MOUNT_DIR } from "./skill-bundle.js";
 export const PROMPT_MOUNT_DIR = "/lastlight";
 export const PROMPT_FILE = `${PROMPT_MOUNT_DIR}/prompt`;
 
+/** Resolved agent-context (persona/hard-rules), delivered the same way as the
+ *  prompt — an extra key on the same per-run prompt Secret, mounted alongside
+ *  it. The `runAgent` script (`kubernetes-sandbox.ts`) copies this file into
+ *  `<cwd>/AGENTS.md` before starting the agent — agentic-pi reads AGENTS.md
+ *  from its cwd. Plan 8 Task 5: the k8s backend has no host-shared workspace
+ *  for the harness to write AGENTS.md into directly (unlike docker/gondolin/
+ *  none/smol), so it rides the pod instead. */
+export const AGENT_CONTEXT_FILE = `${PROMPT_MOUNT_DIR}/AGENTS.md`;
+
 /** Label stamping a sandbox Pod/PVC with the run that owns it — the selector
  *  `reclaimSandbox` (Plan 5) matches on to find a run's objects. `pvc.ts`
  *  reuses this same constant so both objects carry an identical key. */
@@ -33,6 +42,10 @@ export interface PodSpecInput {
   /** Name of the per-run prompt Secret; when set, mounts its `prompt` key as a file at
    *  `PROMPT_FILE` so the entrypoint can pipe it into stdin (Task 6). */
   promptSecret?: string;
+  /** When set alongside `promptSecret`, also projects that same Secret's `agents`
+   *  key as `AGENT_CONTEXT_FILE` — the resolved agent-context (persona/hard-rules)
+   *  the `runAgent` script copies into `<cwd>/AGENTS.md` (Plan 8 Task 5). */
+  agentContextMount?: boolean;
   /** PVC-backed (per-(repo,PR), pre-cloned by an initContainer) or emptyDir
    *  (ephemeral, no pre-clone) workspace — design B (docs/plans/kubernetes-sandbox-backend). */
   workspace: { kind: "pvc"; claimName: string } | { kind: "emptyDir" };
@@ -92,7 +105,18 @@ export function buildPodManifest(i: PodSpecInput): V1Pod {
           ? { name: "workspace", persistentVolumeClaim: { claimName: i.workspace.claimName } }
           : { name: "workspace", emptyDir: {} },
         ...(i.promptSecret
-          ? [{ name: "prompt", secret: { secretName: i.promptSecret, items: [{ key: "prompt", path: "prompt" }] } }]
+          ? [
+              {
+                name: "prompt",
+                secret: {
+                  secretName: i.promptSecret,
+                  items: [
+                    { key: "prompt", path: "prompt" },
+                    ...(i.agentContextMount ? [{ key: "agents", path: "AGENTS.md" }] : []),
+                  ],
+                },
+              },
+            ]
           : []),
         ...(i.skillsMount ? [{ name: "skills", emptyDir: {} }] : []),
       ],
