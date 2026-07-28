@@ -1,7 +1,7 @@
-import { createReadStream, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { createReadStream, createWriteStream, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
-import { spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { type Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -99,9 +99,19 @@ function capTransform(maxBytes: number, kind: "compressed" | "decompressed"): Tr
 
 /**
  * Stream `body` (gzipped tar) into `destDir` via system `tar` (no npm dep —
- * matches `skill-bundle.ts`'s style): `body` → compressed-byte cap → gunzip →
- * decompressed-byte cap → `tar -xf -`. Both caps abort the pipeline the
- * instant they're crossed, before the excess bytes ever reach `tar` or disk.
+ * matches `skill-bundle.ts`'s style). Decompress the upload to a temp tar file
+ * FIRST — `body` → compressed-byte cap → gunzip → decompressed-byte cap → temp
+ * file — then extract it with a single awaited `tar -xf <file>` spawn. Both
+ * caps abort the decompress pipeline (throwing `ArtifactTooLarge`) the instant
+ * they're crossed, before the excess bytes ever reach disk.
+ *
+ * Why the temp file and not `pipeline(body, …, tar.stdin)`: under process/CPU
+ * contention (a busy CI runner's parallel test workers) the `tar` child is slow
+ * to exec and closes its stdin before the pipeline finishes writing, so the
+ * pipeline rejects with `ERR_STREAM_PREMATURE_CLOSE` — an intermittent
+ * extraction failure that only surfaced in CI. A file writable can't be
+ * premature-closed by the child, and one `tar -xf <file>` spawn awaited via
+ * `execFile` removes the coordination race entirely.
  *
  * Traversal defense: both GNU tar and bsdtar refuse to extract entries whose
  * name contains `..` (or an absolute path), exiting non-zero — that's the
@@ -113,45 +123,28 @@ async function extractTarStream(
   maxBundleBytes: number,
   maxDecompressedBytes: number,
 ): Promise<void> {
-  const child = spawn("tar", ["-xf", "-", "-C", destDir], { stdio: ["pipe", "ignore", "pipe"] });
-  const { stdin, stderr } = child;
-  if (!stdin || !stderr) {
-    throw new Error("failed to spawn tar: missing stdio pipes");
-  }
-
-  let stderrText = "";
-  stderr.on("data", (chunk: Buffer) => {
-    stderrText += chunk.toString("utf8");
-  });
-
-  const exitCode = new Promise<number>((resolveExit, rejectExit) => {
-    child.on("error", rejectExit);
-    child.on("close", (code) => resolveExit(code ?? -1));
-  });
-
-  let pipelineError: unknown;
+  const tarDir = mkdtempSync(join(tmpdir(), "ll-artifact-tar-"));
+  const tarFile = join(tarDir, "bundle.tar");
   try {
     await pipeline(
       body,
       capTransform(maxBundleBytes, "compressed"),
       createGunzip(),
       capTransform(maxDecompressedBytes, "decompressed"),
-      stdin,
+      createWriteStream(tarFile),
     );
-  } catch (err) {
-    pipelineError = err;
-  }
-
-  const code = await exitCode;
-
-  if (pipelineError instanceof ArtifactTooLarge) throw pipelineError;
-  if (pipelineError) {
-    const detail = pipelineError instanceof Error ? pipelineError.message : String(pipelineError);
-    throw new Error(`artifact bundle extraction failed: ${detail}`);
-  }
-  if (code !== 0) {
-    const detail = stderrText.trim() || `tar exited with code ${code}`;
-    throw new Error(`artifact bundle extraction failed: ${detail}`);
+    await new Promise<void>((resolveExit, rejectExit) => {
+      execFile("tar", ["-xf", tarFile, "-C", destDir], (err, _stdout, stderr) => {
+        if (err) {
+          const detail = stderr.trim() || err.message;
+          rejectExit(new Error(`artifact bundle extraction failed: ${detail}`));
+          return;
+        }
+        resolveExit();
+      });
+    });
+  } finally {
+    rmSync(tarDir, { recursive: true, force: true });
   }
 }
 
