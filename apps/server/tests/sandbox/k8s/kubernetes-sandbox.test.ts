@@ -186,6 +186,42 @@ describe("KubernetesSandbox", () => {
     expect(secretsDeleted.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("passes --profile to agentic-pi so the github_* extension is enabled", async () => {
+    // Regression: without --profile, agentic-pi doesn't enable its github_*
+    // tools (they're gated per profile) — so triage/pr-review agents run with
+    // only local file/bash tools and can't touch GitHub, despite GITHUB_TOKEN
+    // being in the pod env. The docker backend already passes --profile.
+    const { apis, created } = fakeApis();
+    const sbx = new KubernetesSandbox(factoryOpts, cfg(apis, { namespace: "lastlight-sandboxes" }));
+    await sbx.provision();
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", profile: "issues-write", agentCwd: "/home/agent/workspace" } as any,
+      () => {},
+    );
+    const cmd = created[0].spec.containers[0].command as string[];
+    // Threaded positionally (injection-safe), and the script passes --profile.
+    expect(cmd).toContain("issues-write");
+    const script = cmd.find((a) => a.includes("agentic-pi run"))!;
+    expect(script).toContain("--profile");
+  });
+
+  it("omits --profile when no profile is set", async () => {
+    const { apis, created } = fakeApis();
+    const sbx = new KubernetesSandbox(factoryOpts, cfg(apis, { namespace: "lastlight-sandboxes" }));
+    await sbx.provision();
+    await sbx.runAgent(
+      "t1",
+      "hello",
+      { model: "openai/x", agentCwd: "/home/agent/workspace" } as any,
+      () => {},
+    );
+    const cmd = created[0].spec.containers[0].command as string[];
+    const script = cmd.find((a) => a.includes("agentic-pi run"))!;
+    expect(script).not.toContain("--profile");
+  });
+
   it("runCommand returns the container's real exit code (0)", async () => {
     const { apis } = fakeApis({
       status: { phase: "Succeeded", containerStatuses: [{ state: { terminated: { exitCode: 0 } } }] },
@@ -695,11 +731,13 @@ describe("KubernetesSandbox (creds + workspace + prompt)", () => {
       });
       const command: string[] = pod.spec.containers[0].command;
       expect(command.join(" ")).toContain("< /lastlight/prompt");
-      // Model and the harness endpoint are their own trailing argv elements,
-      // bound to `$1`/`$2` at exec time — NOT interpolated into the script
-      // string (command[2]).
-      expect(command.at(-2)).toBe("anthropic/claude-sonnet-4-6");
-      expect(command.at(-1)).toBe("http://lastlight.lastlight.svc.cluster.local:8644");
+      // Model, the harness endpoint, and the github profile are their own
+      // trailing argv elements, bound to `$1`/`$2`/`$3` at exec time — NOT
+      // interpolated into the script string (command[2]). This run passes no
+      // profile, so the last element is the empty string.
+      expect(command.at(-3)).toBe("anthropic/claude-sonnet-4-6");
+      expect(command.at(-2)).toBe("http://lastlight.lastlight.svc.cluster.local:8644");
+      expect(command.at(-1)).toBe("");
       expect(command[2]).not.toContain("claude-sonnet-4-6");
 
       // ownerRefs patched (both secrets), each as a JSON-Patch "add" op.

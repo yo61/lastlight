@@ -41,6 +41,11 @@ type Workspace = PodSpecInput["workspace"];
 const POD_STATUS_POLL_ATTEMPTS = 15;
 const POD_STATUS_POLL_INTERVAL_MS = 500;
 
+/** agentic-pi github access profiles — the valid `--profile` values. Mirrors the
+ *  docker backend's guard so an unexpected value fails loudly rather than being
+ *  passed through to the CLI. */
+const AGENTIC_PROFILES = new Set(["read", "issues-write", "review-write", "repo-write"]);
+
 /** Bound on the pre-stream "container started" poll. A cold node pulling the
  *  ~400 MB sandbox image straight from GHCR takes ~30s, and a burst of reviews
  *  lands pods on several cold nodes at once (plus scheduling + iSCSI attach) —
@@ -321,9 +326,20 @@ export class KubernetesSandbox implements Sandbox {
     this.artifactToken = this.artifactStore.register(this.opts.taskId);
     const agentContext = loadAgentContext();
     const skillFlags = (opts.skillDirs ?? []).map((d) => `--skill ${d}`).join(" ");
+    // Enable agentic-pi's github_* extension for this run's access profile. The
+    // tools are gated per profile — without `--profile` the agent gets ONLY
+    // local file/bash tools and can't touch GitHub, even though GITHUB_TOKEN is
+    // in the pod env (the docker backend passes this too). Threaded positionally
+    // ($3), like model/endpoint, so it can never break the script's quoting.
+    if (opts.profile && !AGENTIC_PROFILES.has(opts.profile)) {
+      throw new Error(
+        `Refusing to pass profile "${opts.profile}" — must be one of ${[...AGENTIC_PROFILES].join("|")}`,
+      );
+    }
+    const profileFlag = opts.profile ? `--profile "$3"` : "";
     const script =
       `if [ -f ${AGENT_CONTEXT_FILE} ]; then cp ${AGENT_CONTEXT_FILE} ${WORKSPACE_DIR}/AGENTS.md; fi\n` +
-      `agentic-pi run --model "$1" --sandbox none --no-session ${skillFlags} ` +
+      `agentic-pi run --model "$1" --sandbox none --no-session ${profileFlag} ${skillFlags} ` +
       `< ${PROMPT_FILE} ; rc=$?\n` +
       `if [ -d .lastlight ]; then\n` +
       `  tar -czf - .lastlight | curl -sf -X POST ` +
@@ -333,7 +349,7 @@ export class KubernetesSandbox implements Sandbox {
       `exit $rc`;
     await this.runPod({
       taskId,
-      command: ["sh", "-c", script, "sh", opts.model, this.harnessEndpoint],
+      command: ["sh", "-c", script, "sh", opts.model, this.harnessEndpoint, opts.profile ?? ""],
       env: { ...this.opts.env, ...opts.sandboxEnv },
       cwd: opts.agentCwd,
       onLine: parseLine(onEvent),
