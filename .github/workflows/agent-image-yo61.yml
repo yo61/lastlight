@@ -73,7 +73,18 @@ jobs:
         run: |
           BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           export BUILD_DATE
-          docker buildx bake -f docker-bake.hcl --push agent-qemu
+          # The base `agent` target's registry cache (docker-bake.hcl) targets
+          # ${REGISTRY}/lastlight-agent:buildcache — a package this fork can't push
+          # to (it's org-internal, unlinked, and repo-linking is blocked in the UI),
+          # so its cache export was failing the whole build with permission_denied.
+          # Redirect the base cache to a distinct tag inside lastlight-agent-qemu,
+          # which IS repo-linked with write, so caching is preserved and the export
+          # succeeds. Upstream publish.yml is untouched (nearform can write the base
+          # package). `--set *.cache-to=` (empty) is unusable — docker/buildx#3020.
+          BASE_CACHE="${REGISTRY}/lastlight-agent-qemu:buildcache-agent"
+          docker buildx bake -f docker-bake.hcl --push agent-qemu \
+            --set "agent.cache-to=type=registry,ref=${BASE_CACHE},mode=max,image-manifest=true,oci-mediatypes=true" \
+            --set "agent.cache-from=type=registry,ref=${BASE_CACHE}"
         env:
           REGISTRY: ${{ env.REGISTRY }}
           TAG: ${{ env.TAG }}
