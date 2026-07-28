@@ -136,6 +136,36 @@ describe("Sandbox orchestrator (FakeSandbox)", () => {
     expect(result.error).toContain("exceeded quota");
   });
 
+  it("maps a provision-time QuotaExceededError to stopReason error_quota on the agent path", async () => {
+    // The pod-create rejection happens during provisioning, OUTSIDE the
+    // in-callback runAgent try/catch — it must still surface as an error_quota
+    // RESULT (not a throw) so the runner flags backpressure and requeues, rather
+    // than the run terminal-failing red.
+    const fake = new FakeSandbox({ throwOnProvision: new QuotaExceededError("exceeded quota: pods") });
+
+    const result = await executeAgent(
+      "do the thing",
+      { sandbox: "none", stateDir, sessionsDir },
+      { sandboxFactory: fake.asFactory() },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.stopReason).toBe("error_quota");
+    expect(result.error).toContain("exceeded quota");
+  });
+
+  it("propagates a generic provision throw on the agent path (not backpressure)", async () => {
+    const fake = new FakeSandbox({ throwOnProvision: new Error("docker unavailable") });
+
+    await expect(
+      executeAgent(
+        "do the thing",
+        { sandbox: "none", stateDir, sessionsDir },
+        { sandboxFactory: fake.asFactory() },
+      ),
+    ).rejects.toThrow("docker unavailable");
+  });
+
   it("keeps error_sandbox for a generic sandbox throw on the agent path", async () => {
     const fake = new FakeSandbox({ throwOnRunAgent: new Error("boom") });
 

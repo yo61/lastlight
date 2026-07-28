@@ -593,6 +593,9 @@ export interface FakeBehavior {
   commandResult?: RawCommandResult;
   /** Throw from `runCommand`. */
   throwOnRunCommand?: Error | string;
+  /** Throw from `provision` — e.g. a k8s ResourceQuota rejection at pod-create
+   *  time, which happens during provisioning, outside `runAgent`/`runCommand`. */
+  throwOnProvision?: Error | string;
 }
 
 /**
@@ -637,6 +640,7 @@ export class FakeSandbox implements Sandbox {
 
   async provision(pre?: PrePopulateSpec): Promise<ProvisionResult> {
     this.provisionCalls += 1;
+    if (this.behavior.throwOnProvision) throw asError(this.behavior.throwOnProvision);
     const dir = mkdtempSync(join(tmpdir(), "fake-sbx-"));
     this.hostWorkspaceDir = dir;
     this.agentCwd = pre ? join(dir, pre.repo) : dir;
