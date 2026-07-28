@@ -41,10 +41,15 @@ type Workspace = PodSpecInput["workspace"];
 const POD_STATUS_POLL_ATTEMPTS = 15;
 const POD_STATUS_POLL_INTERVAL_MS = 500;
 
-/** Bound on the pre-stream "container started" poll. Image pull can take a
- *  while on a cold node, so this budget (~60 × 1s ≈ 60s) is generous; a
- *  terminal pull/config error fails fast within it (see FATAL_WAITING_REASONS). */
-const POD_START_POLL_ATTEMPTS = 60;
+/** Bound on the pre-stream "container started" poll. A cold node pulling the
+ *  ~400 MB sandbox image straight from GHCR takes ~30s, and a burst of reviews
+ *  lands pods on several cold nodes at once (plus scheduling + iSCSI attach) —
+ *  60s wasn't enough and pods were reaped mid-pull. ~180 × 1s ≈ 180s absorbs a
+ *  cold first-node pull; a terminal pull/config error still fails fast within it
+ *  (see FATAL_WAITING_REASONS), so the extra budget only helps a progressing
+ *  pull. A cluster image mirror (Spegel) makes subsequent nodes pull from a LAN
+ *  peer, so this budget is the fallback for the one node that pulls from GHCR. */
+const POD_START_POLL_ATTEMPTS = 180;
 const POD_START_POLL_INTERVAL_MS = 1000;
 
 /** Bound on the post-delete "pod actually gone" poll (RWO Multi-Attach fix):
