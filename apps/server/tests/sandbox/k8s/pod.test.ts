@@ -146,6 +146,29 @@ describe("buildPodManifest workspace", () => {
   });
 });
 
+describe("buildPodManifest resource requests", () => {
+  const pod = buildPodManifest({
+    name: "ll-x", namespace: "ns", image: "img", command: ["sh", "-c", "true"],
+    envFromSecret: "ll-x-creds", cwd: "/home/agent/workspace",
+    activeDeadlineSeconds: 1800, runAsUser: 10001,
+    workspace: { kind: "pvc", claimName: "ws-acme-web-pr12" },
+    initContainers: [{ name: "clone", image: "img" }],
+    egressPolicy: "strict",
+  });
+
+  it("declares requests (no limits) on the agent container so a compute quota can meter it", () => {
+    const agent = pod.spec?.containers?.[0];
+    expect(agent?.resources?.requests).toEqual({ cpu: "250m", memory: "512Mi" });
+    expect(agent?.resources?.limits).toBeUndefined();
+  });
+
+  it("declares requests on init containers too (a compute quota meters every container)", () => {
+    const init = pod.spec?.initContainers?.[0];
+    expect(init?.resources?.requests).toEqual({ cpu: "100m", memory: "128Mi" });
+    expect(init?.resources?.limits).toBeUndefined();
+  });
+});
+
 describe("buildPodManifest egress label", () => {
   it("stamps egress-policy=strict so the strict CiliumNetworkPolicy selects it", () => {
     const pod = buildPodManifest({

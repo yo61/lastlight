@@ -24,6 +24,17 @@ describe("isQuotaExceeded", () => {
     expect(isQuotaExceeded(apiErr(403, "Exceeded Quota: foo"))).toBe(true);
   });
 
+  it("detects the 'failed quota: must specify …' admission phrasing too", () => {
+    // The ResourceQuota plugin's OTHER rejection: a compute quota exists but the
+    // pod declares no request/limit for a tracked resource. Still a quota
+    // rejection → backpressure, not a hard failure.
+    const err = apiErr(
+      403,
+      'pods "sandbox-x" is forbidden: failed quota: compute: must specify requests.cpu,requests.memory',
+    );
+    expect(isQuotaExceeded(err)).toBe(true);
+  });
+
   it("detects a quota rejection carried only in the composed message (body has no message field)", () => {
     // `body.message` is absent, so the `body?.message` half of the dual-read
     // contributes nothing — the match must come from the composed `err.message`.

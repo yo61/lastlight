@@ -316,8 +316,23 @@ export async function runWorkflow(
     }
   };
 
+  // Backpressure flag (k8s ResourceQuota, design.md §8). Set by `noteStopReason`
+  // / `flagQuotaThrow` (wired into the agent port below) the moment a phase comes
+  // back `error_quota` or throws `QuotaExceededError`. Declared HERE — above
+  // `failWorkflow`/`noteTerminal` — because both must defer to the backpressure
+  // requeue: the engine treats `error_quota` as an ordinary phase failure and
+  // calls `failWorkflow`, but if that finalized the run `failed` the later
+  // `requeueRunning` (CAS on `status = 'running'`) would no-op and the run would
+  // be stuck failed instead of re-queued. This is the root cause #8/#11 missed:
+  // they converted the RESULT/THROW to backpressure but not the fail-flip that
+  // ran first.
+  const quota = { hit: false };
+
   /** Mark the workflow run as failed. */
   const failWorkflow = (errorMsg?: string) => {
+    // Backpressure, not a failure: leave the run `running` so the caller
+    // (`simple.ts`/`resume.ts`) can requeue it for the next admission probe.
+    if (quota.hit) return;
     if (db && workflowId) {
       db.runs.finishRun(workflowId, "failed", { error: errorMsg });
     }
@@ -335,6 +350,9 @@ export async function runWorkflow(
 
   /** Post the run's completion ping — terminal-ping surfaces (Slack) only. */
   const noteTerminal = async (markdown: string): Promise<void> => {
+    // On backpressure the run is being re-queued, not finished — suppress the
+    // `❌ … failed` ping so a quota-deferred run doesn't look like a failure.
+    if (quota.hit) return;
     if (reporter) await reporter.noteTerminal(markdown);
   };
 
@@ -373,10 +391,10 @@ export async function runWorkflow(
 
   // Backpressure detection: a phase whose ExecutionResult carries
   // `stopReason: "error_quota"` means the k8s ResourceQuota rejected its pod
-  // (design.md §8). We flag the run so the terminal handler requeues instead of
+  // (design.md §8). `quota.hit` (declared above, next to `failWorkflow`) is
+  // flipped here so the terminal handlers defer to the requeue instead of
   // failing. The engine (runWorkflowCore) stays backend-agnostic — this lives
   // entirely in the server-owned port wrapper.
-  const quota = { hit: false };
   const noteStopReason = (r: ExecutionResult): ExecutionResult => {
     if (r.stopReason === "error_quota") quota.hit = true;
     return r;

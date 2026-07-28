@@ -14,10 +14,21 @@ export class QuotaExceededError extends Error {
   }
 }
 
-/** True iff `err` is a k8s `403` whose message names an exceeded quota. */
+/**
+ * True iff `err` is a k8s `403` produced by the ResourceQuota admission plugin.
+ * That plugin emits two phrasings, both of which are the quota rejecting the
+ * create and both of which we treat as backpressure:
+ *  - over the limit — `... is forbidden: exceeded quota: <name>, requested: ...`
+ *  - missing a metered field — `... is forbidden: failed quota: <name>: must
+ *    specify requests.cpu, ...` (fires when a compute quota exists but the pod
+ *    declares no request/limit for a tracked resource). Sandbox pods now set
+ *    resource requests (`pod.ts`), so this form shouldn't originate from us —
+ *    matching it is defence-in-depth so such a rejection re-queues (bounded by
+ *    the queue TTL) rather than hard-failing the run.
+ */
 export function isQuotaExceeded(err: unknown): boolean {
   if (!(err instanceof ApiException) || err.code !== 403) return false;
   const body = err.body as { message?: string } | undefined;
   const text = `${body?.message ?? ""} ${err.message ?? ""}`;
-  return /exceeded quota/i.test(text);
+  return /(?:exceeded|failed) quota/i.test(text);
 }
