@@ -31,6 +31,7 @@ vi.mock("child_process", () => ({ execSync: vi.fn() }));
 import { executeAgent, executeCommand } from "#src/engine/agent-executor.js";
 import { loadPromptTemplate } from "#src/workflows/loader.js";
 import { runWorkflow, gitAccessProfileForWorkflow, gitSandboxAccessForWorkflow } from "#src/workflows/runner.js";
+import { QuotaExceededError } from "#src/sandbox/k8s/quota.js";
 
 const mockExecuteAgent = vi.mocked(executeAgent);
 const mockExecuteCommand = vi.mocked(executeCommand);
@@ -264,6 +265,22 @@ describe("runWorkflow — backpressure", () => {
       error: "exceeded quota: pods",
       stopReason: "error_quota",
     });
+
+    const result = await runWorkflow(SIMPLE_WORKFLOW, BASE_CTX, {} as never, {});
+    expect(result.success).toBe(false);
+    expect(result.backpressure).toBe(true);
+  });
+
+  it("requeues (backpressure) when a quota rejection propagates as a THROW on a single-phase workflow", async () => {
+    // The k8s incident: issue-triage is ONE agent phase, so a quota-rejected
+    // pod-create fails the only phase and throws OUT of the engine (no cascade
+    // to skip like a multi-phase workflow), bypassing the post-await quota.hit
+    // check. The run must still requeue, not terminal-fail red.
+    // Production path: the pod-create quota rejection propagates as a THROWN
+    // QuotaExceededError (executeAgent rejects, not resolves), so noteStopReason's
+    // `.then` is skipped. The run must still be flagged as backpressure (via the
+    // port `.catch`) and requeue, not terminal-fail.
+    mockExecuteAgent.mockRejectedValue(new QuotaExceededError("pod create rejected by ResourceQuota"));
 
     const result = await runWorkflow(SIMPLE_WORKFLOW, BASE_CTX, {} as never, {});
     expect(result.success).toBe(false);
