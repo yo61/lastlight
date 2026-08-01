@@ -39,7 +39,7 @@ name: Publish release
 # the agent image, so it's covered too.
 #
 # CACHING: driven by `docker buildx bake` against docker-bake.hcl. Each image
-# has a per-image **registry** build cache (ghcr.io/nearform/lastlight-<img>:
+# has a per-image **registry** build cache (<registry>/lastlight-<img>:
 # buildcache) that any run can read, so unchanged layers survive across releases.
 #
 #   Why registry and not `type=gha`: this workflow only runs on a RELEASE (a tag
@@ -87,7 +87,10 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
     env:
-      REGISTRY: ghcr.io/nearform
+      # Publish to the GHCR namespace of whoever owns the repo running this:
+      # ghcr.io/nearform on upstream, ghcr.io/<fork-owner> on a fork. Lets a fork
+      # build+push its own images (workflow_dispatch on a branch) with no edit.
+      REGISTRY: ghcr.io/${{ github.repository_owner }}
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       # Only move `:latest` on a real, non-prerelease Release — never when a
       # workflow_dispatch rebuilds an arbitrary (possibly older) tag.
