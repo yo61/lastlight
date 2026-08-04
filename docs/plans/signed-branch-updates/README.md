@@ -118,10 +118,19 @@ registered against the App's account for GitHub to mark it verified. Deferred
 here because `update-branch` solves the common case with no key at all — but if
 the `dirty`-PR gap proves to bite in practice, this is the answer.
 
-## Verification note
+## Verification
 
 GitHub's REST reference for `update-branch` does not explicitly document the
-signing behaviour of the commit it creates. The general rule is documented
-("all commits merged through the GitHub UI are signed with GitHub's web-flow
-key") and every server-side commit in `go-udap`'s history is `verified: true`,
-but the first PR that uses this path should be checked rather than assumed.
+signing behaviour of the commit it creates, so it was verified directly rather
+than assumed. Run against `go-udap#189` and `#190` on 2026-08-04:
+
+```
+cbe3309c committer=GitHub <noreply@github.com> verified=true reason=valid
+f64c7c62 committer=GitHub <noreply@github.com> verified=true reason=valid
+```
+
+Both landed as `Merge branch 'main' into <branch>`. Worth noting for anyone
+auditing history later: a sandbox merge writes `Merge remote-tracking branch
+'origin/main' into <branch>` instead, because `git merge origin/<base>` names
+the remote-tracking ref in its default message. The two mechanisms are
+distinguishable from the commit message alone.
